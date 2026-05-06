@@ -13,7 +13,7 @@ import { ClusteringSwitchEditor, DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED 
  */
 
 export function addAnnotationOptions<T extends common.OptionsWithAnnotations>(builder: PanelOptionsEditorBuilder<T>) {
-  const category = [t('grafana-ui.builder.annotations', 'Annotations')];
+  const category = [t('grafana-ui.builder.annotations.label', 'Annotations')];
 
   builder.addBooleanSwitch({
     path: 'annotations.multiLane',

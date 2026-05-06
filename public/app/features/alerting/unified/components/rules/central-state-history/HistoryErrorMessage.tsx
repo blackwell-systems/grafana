@@ -46,7 +46,7 @@ export function HistoryErrorMessage({ error }: HistoryErrorMessageProps) {
     );
   }
 
-  const title = t('alerting.central-alert-history.error', 'Something went wrong loading the alert state history');
+  const title = t('alerting.central-alert-history.error.title', 'Something went wrong loading the alert state history');
   const errorStr = stringifyErrorLike(error);
 
   return <Alert title={title}>{errorStr}</Alert>;

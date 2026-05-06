@@ -787,7 +787,8 @@
         "value-in-transition": "Value in transition"
       },
       "error": {
-        "server-error": "The alert state history query failed — the server returned an error"
+        "server-error": "The alert state history query failed — the server returned an error",
+        "title": "Something went wrong loading the alert state history"
       },
       "filter": {
         "clear": "Clear filters",
@@ -10047,7 +10048,9 @@
       "log-base": "Log base"
     },
     "builder": {
-      "annotations": "Annotations",
+      "annotations": {
+        "label": "Annotations"
+      },
       "axis": {
         "category-axis": "Axis",
         "color-label": "Color",
@@ -10375,10 +10378,18 @@
     },
     "matchers": {
       "groups": {
-        "annotation": "Annotations",
-        "exemplar": "Exemplars",
-        "nested": "Nested",
-        "series": "Dataframe"
+        "annotation": {
+          "label": "Annotations"
+        },
+        "exemplar": {
+          "label": "Exemplars"
+        },
+        "nested": {
+          "label": "Nested"
+        },
+        "series": {
+          "label": "Dataframe"
+        }
       },
       "labels": {
         "base-field-name": "{{name}} (base field name)",

@@ -85,14 +85,14 @@ export function getFrameFieldsDisplayNames(
 export function getGroupLabelForScope(scope?: MatcherScope): string | undefined {
   switch (scope) {
     case 'nested':
-      return t('grafana-ui.matchers.groups.nested', 'Nested');
+      return t('grafana-ui.matchers.groups.nested.label', 'Nested');
     case 'annotation':
-      return t('grafana-ui.matchers.groups.annotation', 'Annotations');
+      return t('grafana-ui.matchers.groups.annotation.label', 'Annotations');
     case 'exemplar':
-      return t('grafana-ui.matchers.groups.exemplar', 'Exemplars');
+      return t('grafana-ui.matchers.groups.exemplar.label', 'Exemplars');
     case 'series':
     default:
-      return t('grafana-ui.matchers.groups.series', 'Dataframe');
+      return t('grafana-ui.matchers.groups.series.label', 'Dataframe');
   }
 }
 
