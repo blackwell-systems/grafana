@@ -1,31 +1,34 @@
 // Package writepath keeps the vector index in sync with ongoing dashboard
-// writes. The scanner combines two signals:
+// writes. The scanner combines two signals into a single in-memory queue
+// keyed by (group, resource, namespace, name) and dedup'd by RV: an event
+// is only kept if its RV is strictly greater than whatever the queue
+// already holds for that resource. Older RVs are silently dropped at
+// enqueue time, which removes the "older event overwrites newer" race
+// when bootstrap and watch both surface the same dashboard.
+//
+// Two producers feed the queue:
 //
 //  1. WatchWriteEvents — a long-lived subscription that streams every
-//     dashboard write across the cluster. Each event adds the affected
-//     namespace to a "needs scan" set; the watch is purely a hint, never
-//     the source of truth for the embedded value.
+//     dashboard write across the cluster. The event payload (its Value)
+//     is enqueued directly so the cycle never has to fetch it again.
 //
-//  2. ListModifiedSince per namespace — the cycle, every PollInterval,
-//     drains the set, calls ListModifiedSince(ns, vector_latest_rv) for
-//     each, dedups events whose RV ≤ checkpoint, and upserts the rest.
-//     The cursor is the only dedup mechanism: replayed watch events for
-//     already-processed RVs are filtered by the SQL query for free.
+//  2. Bootstrap (at startup) — uses the NamespaceLister capability to
+//     enumerate namespaces with activity past vector_latest_rv, then
+//     calls ListModifiedSince per namespace and enqueues each event.
+//     Catches anything that committed while the process was down and
+//     isn't replayed by the new watch subscription.
 //
-// At startup the scanner bootstraps the set so anything that committed
-// while the process was down (and isn't replayed by the watch) still
-// gets picked up. Discovery prefers the cheap NamespaceLister capability
-// (SQL backend), falling back to GetResourceStats for backends that
-// don't implement it.
-//
-// All embedding work for a cycle is pooled: one EmbedText call covers
-// every panel from every flagged namespace, then one Upsert writes them
-// in a single transaction. Provider-side chunking (e.g. Vertex's 250-text
+// Each cycle drains the queue, drops events whose RV ≤ checkpoint
+// (cursor-level dedup of replayed history), executes deletes inline,
+// and pools every panel that needs embedding into one EmbedText call
+// followed by one Upsert. Provider-side chunking (e.g. Vertex's 250-text
 // limit) lives inside EmbedText.
 //
-// The scanner is the sole writer of vector_latest_rv. The backfiller has
-// its own state (vector_backfill_jobs) and may run concurrently; both
-// produce idempotent upserts on the same key shape, so a brief overlap is
+// On any per-cycle failure the affected events are re-enqueued so the
+// next cycle retries them. The scanner is the sole writer of
+// vector_latest_rv. The backfiller has its own state
+// (vector_backfill_jobs) and may run concurrently; both produce
+// idempotent upserts on the same key shape, so brief overlap is
 // harmless.
 package writepath
 
@@ -48,14 +51,33 @@ import (
 // there is no work or the lock is held by another replica.
 const DefaultPollInterval = 30 * time.Second
 
-// NamespaceLister is an optional capability backends may implement to
-// answer "which namespaces have any change since RV X?" cheaply. Used
-// at scanner bootstrap so we don't have to walk every namespace via
-// GetResourceStats. Backends that don't implement it fall back to
-// GetResourceStats — the scanner still works, just less efficiently on
-// first start.
+// NamespaceLister is the capability backends must implement so the
+// scanner can bootstrap without walking every namespace. Both the SQL
+// and KV backends implement it; the scanner refuses to recover missed
+// writes when a backend doesn't.
 type NamespaceLister interface {
 	ListNamespacesModifiedSince(ctx context.Context, group, resource string, sinceRv int64) ([]string, error)
+}
+
+// pendingEvent is one queued change waiting to be embedded/upserted/
+// deleted. Fields are flattened (rather than holding a *ResourceKey)
+// because resourcepb.ResourceKey embeds protoimpl.MessageState which
+// wraps a sync.Mutex — copying it triggers go vet's `copylocks`
+// warning. We don't need the protobuf shape for in-memory queueing.
+type pendingEvent struct {
+	action    resourcepb.WatchEvent_Type
+	group     string
+	resource  string
+	namespace string
+	name      string
+	value     []byte // payload for upserts; nil/empty for deletes
+	rv        int64
+}
+
+// eventQueueKey is the dedup key — one pending event per resource at a
+// time, regardless of how many writes it received.
+func eventQueueKey(group, resource, namespace, name string) string {
+	return group + "/" + resource + "/" + namespace + "/" + name
 }
 
 type Options struct {
@@ -77,11 +99,11 @@ type Scanner struct {
 	pollInterval  time.Duration
 	log           log.Logger
 
-	// nsToScan holds namespaces flagged by the watch loop or bootstrap.
-	// The cycle drains it, runs ListModifiedSince per namespace, and
-	// re-adds entries that didn't fully advance.
-	mu       sync.Mutex
-	nsToScan map[string]struct{}
+	// queue holds at most one pendingEvent per resource. Enqueue keeps
+	// the highest RV; the cycle drains it under lock, processes, and
+	// re-enqueues anything that didn't make it.
+	queueMu sync.Mutex
+	queue   map[string]*pendingEvent
 }
 
 func New(opts Options) (*Scanner, error) {
@@ -120,36 +142,46 @@ func New(opts Options) (*Scanner, error) {
 		builders:      builders,
 		pollInterval:  opts.PollInterval,
 		log:           opts.Log,
-		nsToScan:      make(map[string]struct{}),
+		queue:         make(map[string]*pendingEvent),
 	}, nil
 }
 
-// flagNamespace marks a namespace for scanning. Empty strings are
-// dropped — they would mean a cluster-scoped event, which dashboards
-// don't produce.
-func (s *Scanner) flagNamespace(ns string) {
-	if ns == "" {
+// enqueue adds an event to the queue if its RV is strictly greater than
+// any pending event for the same resource. Older RVs are silently
+// dropped — the dedup is the whole point of using a map keyed by
+// resource identity. Events for resources without a registered builder
+// or with an empty namespace (cluster-scoped) are ignored.
+func (s *Scanner) enqueue(ev *pendingEvent) {
+	if ev == nil || ev.namespace == "" {
 		return
 	}
-	s.mu.Lock()
-	s.nsToScan[ns] = struct{}{}
-	s.mu.Unlock()
+	builder, ok := s.builders[ev.resource]
+	if !ok || builder.Group() != ev.group {
+		return
+	}
+	k := eventQueueKey(ev.group, ev.resource, ev.namespace, ev.name)
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if existing, ok := s.queue[k]; ok && existing.rv >= ev.rv {
+		return
+	}
+	s.queue[k] = ev
 }
 
-// drainNamespaces returns and clears the current set. Watch events that
-// arrive after this call go into the next cycle; failures during the
-// current cycle re-add specific namespaces via flagNamespace.
-func (s *Scanner) drainNamespaces() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.nsToScan) == 0 {
+// drainQueue returns and clears every pending event. Events that arrive
+// after this call go into the next cycle; per-cycle failures re-enqueue
+// specific events.
+func (s *Scanner) drainQueue() []*pendingEvent {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if len(s.queue) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(s.nsToScan))
-	for ns := range s.nsToScan {
-		out = append(out, ns)
+	out := make([]*pendingEvent, 0, len(s.queue))
+	for _, ev := range s.queue {
+		out = append(out, ev)
 	}
-	s.nsToScan = make(map[string]struct{})
+	s.queue = make(map[string]*pendingEvent)
 	return out
 }
 
@@ -190,10 +222,10 @@ func (s *Scanner) Run(ctx context.Context) error {
 	}
 }
 
-// consumeWatchEvents flags namespaces of dashboard writes for the next
-// cycle. Events for unsupported groups/resources are ignored; events
-// whose RV is already past vector_latest_rv get filtered cheaply by
-// ListModifiedSince when the cycle runs, so we don't dedup here.
+// consumeWatchEvents enqueues every dashboard write the watch surfaces.
+// Events for unsupported groups/resources are dropped; events with an
+// older RV than what we already have queued for the same resource are
+// dropped at enqueue time.
 func (s *Scanner) consumeWatchEvents(ctx context.Context, ch <-chan *resource.WrittenEvent) {
 	logger := s.log.FromContext(ctx)
 	for {
@@ -208,17 +240,23 @@ func (s *Scanner) consumeWatchEvents(ctx context.Context, ch <-chan *resource.Wr
 			if ev == nil || ev.Key == nil {
 				continue
 			}
-			if _, ok := s.builders[ev.Key.Resource]; !ok {
-				continue
-			}
-			s.flagNamespace(ev.Key.Namespace)
+			s.enqueue(&pendingEvent{
+				action:    ev.Type,
+				group:     ev.Key.Group,
+				resource:  ev.Key.Resource,
+				namespace: ev.Key.Namespace,
+				name:      ev.Key.Name,
+				value:     ev.Value,
+				rv:        ev.ResourceVersion,
+			})
 		}
 	}
 }
 
-// bootstrap discovers namespaces with activity past the current
-// checkpoint and flags them. Prefers the cheap NamespaceLister
-// capability; falls back to GetResourceStats.
+// bootstrap discovers events committed past the current checkpoint and
+// enqueues them. Discovery is two-phase per builder: NamespaceLister
+// returns the active namespaces, then ListModifiedSince(ns, sinceRv)
+// gives us each event with its payload.
 func (s *Scanner) bootstrap(ctx context.Context) {
 	logger := s.log.FromContext(ctx)
 	sinceRv, err := s.vectorBackend.GetLatestRV(ctx)
@@ -226,35 +264,65 @@ func (s *Scanner) bootstrap(ctx context.Context) {
 		logger.Error("writepath: bootstrap read checkpoint", "err", err)
 		return
 	}
+	effective := sinceRv
+	if effective <= 0 {
+		effective = 1
+	}
 	for _, b := range s.builders {
-		s.bootstrapBuilder(ctx, b, sinceRv, logger)
+		s.bootstrapBuilder(ctx, b, effective, logger)
 	}
 }
 
 func (s *Scanner) bootstrapBuilder(ctx context.Context, builder embed.Builder, sinceRv int64, logger log.Logger) {
-	if nl, ok := s.storage.(NamespaceLister); ok {
-		nss, err := nl.ListNamespacesModifiedSince(ctx, builder.Group(), builder.Resource(), sinceRv)
-		if err == nil {
-			for _, ns := range nss {
-				s.flagNamespace(ns)
-			}
-			return
-		}
-		// Fall through to GetResourceStats on error so a misconfigured
-		// optimization path doesn't break boot.
-		logger.Warn("writepath: NamespaceLister failed, falling back to GetResourceStats",
-			"group", builder.Group(), "resource", builder.Resource(), "err", err)
-	}
-	stats, err := s.storage.GetResourceStats(ctx, resource.NamespacedResource{
-		Group:    builder.Group(),
-		Resource: builder.Resource(),
-	}, 0)
-	if err != nil {
-		logger.Error("writepath: bootstrap GetResourceStats", "err", err)
+	nl, ok := s.storage.(NamespaceLister)
+	if !ok {
+		logger.Warn("writepath: storage doesn't implement NamespaceLister; cannot recover missed writes",
+			"group", builder.Group(), "resource", builder.Resource())
 		return
 	}
-	for _, st := range stats {
-		s.flagNamespace(st.Namespace)
+	nss, err := nl.ListNamespacesModifiedSince(ctx, builder.Group(), builder.Resource(), sinceRv)
+	if err != nil {
+		logger.Error("writepath: NamespaceLister failed",
+			"group", builder.Group(), "resource", builder.Resource(), "err", err)
+		return
+	}
+	for _, ns := range nss {
+		if ctx.Err() != nil {
+			return
+		}
+		s.bootstrapNamespace(ctx, builder, ns, sinceRv, logger)
+	}
+}
+
+// bootstrapNamespace pulls every event past sinceRv for one namespace
+// and enqueues it. ListModifiedSince already collapses repeated writes
+// to the same resource down to the latest RV, but the queue's
+// RV-keyed dedup makes that a defence-in-depth.
+func (s *Scanner) bootstrapNamespace(ctx context.Context, builder embed.Builder, namespace string, sinceRv int64, logger log.Logger) {
+	key := resource.NamespacedResource{
+		Namespace: namespace,
+		Group:     builder.Group(),
+		Resource:  builder.Resource(),
+	}
+	_, seq := s.storage.ListModifiedSince(ctx, key, sinceRv, nil)
+	for mr, err := range seq {
+		if err != nil {
+			logger.Warn("writepath: bootstrap iterator error",
+				"namespace", namespace, "err", err)
+			return
+		}
+		if mr == nil {
+			continue
+		}
+		s.enqueue(&pendingEvent{
+			action:    mr.Action,
+			group:     mr.Key.Group,
+			resource:  mr.Key.Resource,
+			namespace: mr.Key.Namespace,
+			name:      mr.Key.Name,
+			value:     mr.Value,
+			rv:        mr.ResourceVersion,
+		})
 	}
 }
 
@@ -271,233 +339,218 @@ func (s *Scanner) runOnce(ctx context.Context) {
 	}
 	defer release()
 
-	for _, b := range s.builders {
-		if ctx.Err() != nil {
-			return
-		}
-		s.scanBuilder(ctx, b)
-	}
+	s.processQueue(ctx)
 }
 
 // pendingEmbed pairs a partially-built vector with the text that still
-// needs an embedding. Pooling these across all namespaces lets the
-// scanner make a single EmbedText call per cycle even when many
-// dashboards changed in different tenants.
+// needs an embedding. Pooling these across resources lets the scanner
+// make a single EmbedText call per cycle even when many dashboards
+// changed across different tenants.
 type pendingEmbed struct {
 	proto vector.Vector // every field set except Embedding
 	text  string
 }
 
-// scanBuilder drains the namespace set, fans out per-namespace
-// ListModifiedSince calls, pools every panel that needs embedding into
-// one call, and advances vector_latest_rv based on the global outcome.
-// Deletes execute inline because they don't need the embedder. On
-// failure (any namespace partially processed, or pooled embed/upsert
-// errored), namespaces with unfinished work are re-flagged so the next
-// cycle retries them.
-func (s *Scanner) scanBuilder(ctx context.Context, builder embed.Builder) {
-	logger := s.log.FromContext(ctx).New("group", builder.Group(), "resource", builder.Resource())
+// processQueue drains the pending-event queue, executes deletes inline,
+// pools every panel that needs embedding into one EmbedText/Upsert
+// pair, and advances vector_latest_rv based on the global outcome.
+// Events whose RV is already past vector_latest_rv (replayed history)
+// are dropped at the cursor check. On any failure, the affected events
+// are re-enqueued so the next cycle retries them.
+func (s *Scanner) processQueue(ctx context.Context) {
+	logger := s.log.FromContext(ctx)
 
-	namespaces := s.drainNamespaces()
-	if len(namespaces) == 0 {
+	pending := s.drainQueue()
+	if len(pending) == 0 {
 		return
 	}
 
 	sinceRv, err := s.vectorBackend.GetLatestRV(ctx)
 	if err != nil {
 		logger.Error("writepath: read checkpoint", "err", err)
-		// Re-flag so a transient checkpoint read failure doesn't drop work.
-		for _, ns := range namespaces {
-			s.flagNamespace(ns)
-		}
+		s.requeue(pending)
 		return
 	}
-	// ListModifiedSince treats sinceRv == 0 as an error; bump to 1 so
-	// the very first scan covers all history.
-	effectiveSince := sinceRv
-	if effectiveSince <= 0 {
-		effectiveSince = 1
-	}
 
-	// Aggregate across namespaces. vector_latest_rv is a single global
-	// cursor and storage RVs are globally monotonic, so we collapse
-	// per-namespace progress into one (sinceRv, latestRv, lowestFailedRv)
-	// triple and feed it to chooseTarget once.
+	// Track per-event outcome so we know what to re-enqueue. The lowest
+	// failed RV pins the global advance below it, ensuring failed work
+	// is retried before the cursor moves past.
 	var (
-		pending        []pendingEmbed
+		pooled         []pendingEmbed
+		pooledOwners   []*pendingEvent // 1:1 alignment is impossible (multi-panel), so we re-enqueue source events on pooled failure separately
+		failed         []*pendingEvent
+		successes      []*pendingEvent
 		lowestFailedRv = int64(math.MaxInt64)
-		maxLatestRv    int64
-		processed      int // counts inline-processed work (deletes); pooled embeds counted later
+		maxRv          = sinceRv
 	)
-	for _, ns := range namespaces {
+	_ = pooledOwners // see comment below; we track owners as a slice of source events
+
+	// Source events that contributed to `pooled` so we can re-enqueue
+	// them on pooled failure.
+	var pooledSources []*pendingEvent
+
+	for _, ev := range pending {
 		if ctx.Err() != nil {
-			// Re-flag remaining work so we resume next cycle.
-			for _, ns := range namespaces {
-				s.flagNamespace(ns)
-			}
+			s.requeue(pending)
 			return
 		}
-		nsLatest, nsProcessed, nsLowestFailed := s.collectNamespace(ctx, builder, ns, effectiveSince, &pending, logger)
-		if nsLatest > maxLatestRv {
-			maxLatestRv = nsLatest
+		// Cursor-level dedup: anything ≤ checkpoint was already
+		// processed by a prior cycle (or is replayed history from the
+		// watch). Drop it without touching state.
+		if ev.rv <= sinceRv {
+			continue
 		}
-		if nsLowestFailed < lowestFailedRv {
-			lowestFailedRv = nsLowestFailed
+		builder, ok := s.builders[ev.resource]
+		if !ok {
+			continue
 		}
-		processed += nsProcessed
+
+		switch ev.action {
+		case resourcepb.WatchEvent_DELETED:
+			if err := s.vectorBackend.Delete(ctx, ev.namespace, s.embedder.Model, builder.Resource(), ev.name); err != nil {
+				logger.Warn("writepath: delete vector",
+					"namespace", ev.namespace, "name", ev.name,
+					"rv", ev.rv, "err", err)
+				failed = append(failed, ev)
+				if ev.rv < lowestFailedRv {
+					lowestFailedRv = ev.rv
+				}
+				continue
+			}
+			successes = append(successes, ev)
+
+		case resourcepb.WatchEvent_ADDED, resourcepb.WatchEvent_MODIFIED:
+			added, err := s.collectUpsertEvent(ctx, builder, ev, &pooled)
+			if err != nil {
+				logger.Warn("writepath: collect event",
+					"namespace", ev.namespace, "name", ev.name,
+					"rv", ev.rv, "err", err)
+				failed = append(failed, ev)
+				if ev.rv < lowestFailedRv {
+					lowestFailedRv = ev.rv
+				}
+				continue
+			}
+			if added {
+				pooledSources = append(pooledSources, ev)
+			} else {
+				// Empty extract / no-content: nothing to embed; treat as success.
+				successes = append(successes, ev)
+			}
+
+		default:
+			logger.Warn("writepath: unknown action",
+				"namespace", ev.namespace, "name", ev.name,
+				"rv", ev.rv, "action", ev.action)
+			failed = append(failed, ev)
+			if ev.rv < lowestFailedRv {
+				lowestFailedRv = ev.rv
+			}
+			continue
+		}
+		if ev.rv > maxRv {
+			maxRv = ev.rv
+		}
 	}
 
-	pooledFailed := false
-	if len(pending) > 0 {
-		if err := s.embedAndUpsertPooled(ctx, pending); err != nil {
-			pooledFailed = true
+	// Single pooled embed + upsert. Failure here invalidates every
+	// source event that contributed; re-enqueue the lot.
+	if len(pooled) > 0 {
+		if err := s.embedAndUpsertPooled(ctx, pooled); err != nil {
 			logger.Error("writepath: pooled embed/upsert",
-				"items", len(pending), "err", err)
-			// Treat the whole batch as failed: pin lowestFailedRv to the
-			// minimum RV among pending items so we retry the whole window.
-			for _, p := range pending {
-				if p.proto.ResourceVersion < lowestFailedRv {
-					lowestFailedRv = p.proto.ResourceVersion
+				"items", len(pooled), "sources", len(pooledSources), "err", err)
+			for _, ev := range pooledSources {
+				failed = append(failed, ev)
+				if ev.rv < lowestFailedRv {
+					lowestFailedRv = ev.rv
 				}
 			}
 		} else {
-			processed += len(pending)
+			successes = append(successes, pooledSources...)
 		}
 	}
 
-	target := chooseTarget(sinceRv, maxLatestRv, lowestFailedRv)
+	target := chooseTarget(sinceRv, maxRv, lowestFailedRv)
 	if target > sinceRv {
 		if err := s.vectorBackend.SetLatestRV(ctx, target); err != nil {
 			logger.Error("writepath: advance checkpoint", "err", err, "target", target)
-			// Couldn't persist the cursor; re-flag so we don't lose work.
-			for _, ns := range namespaces {
-				s.flagNamespace(ns)
-			}
+			// Cursor write failed; we can't tell what's persisted.
+			// Re-enqueue everything we drained so nothing is dropped.
+			s.requeue(pending)
 			return
 		}
 	}
 
-	// Re-flag namespaces that didn't fully advance. With pooled all-or-
-	// nothing semantics, that means "everything we processed" on any
-	// failure, since we can't tell which namespace owned the failing item.
-	if pooledFailed || lowestFailedRv != math.MaxInt64 {
-		for _, ns := range namespaces {
-			s.flagNamespace(ns)
-		}
+	// Re-enqueue events that didn't make the cut. The cursor advance
+	// guarantees `target ≥ ev.rv` for every successful event, so
+	// re-queueing failures alone is sufficient — the cursor filter on
+	// the next cycle handles everything else.
+	for _, ev := range failed {
+		s.enqueue(ev)
 	}
 
-	if processed > 0 || target > sinceRv {
+	if len(successes) > 0 || target > sinceRv {
 		logger.Debug("writepath: cycle complete",
-			"namespaces", len(namespaces),
-			"processed", processed,
-			"pooled_items", len(pending),
+			"drained", len(pending),
+			"succeeded", len(successes),
+			"failed", len(failed),
+			"pooled_items", len(pooled),
 			"from", sinceRv, "to", target)
 	}
 }
 
-// collectNamespace processes one namespace's slice of changes. Deletes
-// execute inline; updates queue items into `pending` for the pooled
-// embed step. Returns the latestRv reported by the backend, the count
-// of inline-completed items (deletes only), and the lowest RV that
-// failed inline (math.MaxInt64 if none).
-func (s *Scanner) collectNamespace(ctx context.Context, builder embed.Builder, namespace string, sinceRv int64, pending *[]pendingEmbed, logger log.Logger) (int64, int, int64) {
-	key := resource.NamespacedResource{
-		Namespace: namespace,
-		Group:     builder.Group(),
-		Resource:  builder.Resource(),
+// requeue puts every event back. Used when we can't tell what's
+// persisted (e.g. cursor write failed) and have to assume the worst.
+func (s *Scanner) requeue(events []*pendingEvent) {
+	for _, ev := range events {
+		s.enqueue(ev)
 	}
-	latestRv, seq := s.storage.ListModifiedSince(ctx, key, sinceRv, nil)
-
-	lowestFailedRv := int64(math.MaxInt64)
-	processed := 0
-	for mr, iterErr := range seq {
-		if ctx.Err() != nil {
-			return latestRv, processed, lowestFailedRv
-		}
-		if iterErr != nil {
-			logger.Error("writepath: iterator error", "namespace", namespace, "err", iterErr)
-			// Treat the whole namespace as failed at sinceRv so the
-			// global advance stays put.
-			return latestRv, processed, sinceRv
-		}
-		if mr == nil {
-			continue
-		}
-		switch mr.Action {
-		case resourcepb.WatchEvent_DELETED:
-			if err := s.vectorBackend.Delete(ctx, mr.Key.Namespace, s.embedder.Model, builder.Resource(), mr.Key.Name); err != nil {
-				logger.Warn("writepath: delete vector",
-					"namespace", mr.Key.Namespace, "name", mr.Key.Name,
-					"rv", mr.ResourceVersion, "err", err)
-				if mr.ResourceVersion < lowestFailedRv {
-					lowestFailedRv = mr.ResourceVersion
-				}
-				continue
-			}
-			processed++
-		case resourcepb.WatchEvent_ADDED, resourcepb.WatchEvent_MODIFIED:
-			if err := s.collectForUpsert(ctx, builder, mr, pending); err != nil {
-				logger.Warn("writepath: collect item",
-					"namespace", mr.Key.Namespace, "name", mr.Key.Name,
-					"rv", mr.ResourceVersion, "err", err)
-				if mr.ResourceVersion < lowestFailedRv {
-					lowestFailedRv = mr.ResourceVersion
-				}
-			}
-		default:
-			logger.Warn("writepath: unknown action",
-				"namespace", mr.Key.Namespace, "name", mr.Key.Name,
-				"rv", mr.ResourceVersion, "action", mr.Action)
-			if mr.ResourceVersion < lowestFailedRv {
-				lowestFailedRv = mr.ResourceVersion
-			}
-		}
-	}
-	return latestRv, processed, lowestFailedRv
 }
 
-// collectForUpsert extracts items from a single dashboard, runs
-// stale-subresource cleanup immediately, and queues each item with its
-// owning resource metadata for the pooled embed step.
-func (s *Scanner) collectForUpsert(ctx context.Context, builder embed.Builder, mr *resource.ModifiedResource, pending *[]pendingEmbed) error {
-	if len(mr.Value) == 0 {
-		// Empty payload on a non-delete event is treated as nothing to embed.
-		return nil
+// collectUpsertEvent extracts items from one event's payload, runs
+// stale-subresource cleanup, and appends every item with content into
+// `pooled`. Returns true when at least one item was queued for
+// embedding.
+func (s *Scanner) collectUpsertEvent(ctx context.Context, builder embed.Builder, ev *pendingEvent, pooled *[]pendingEmbed) (bool, error) {
+	if len(ev.value) == 0 {
+		return false, nil
 	}
 	key := &resourcepb.ResourceKey{
 		Group:     builder.Group(),
 		Resource:  builder.Resource(),
-		Namespace: mr.Key.Namespace,
-		Name:      mr.Key.Name,
+		Namespace: ev.namespace,
+		Name:      ev.name,
 	}
-	items, err := builder.Extract(ctx, key, mr.Value, "")
+	items, err := builder.Extract(ctx, key, ev.value, "")
 	if err != nil {
-		return fmt.Errorf("extract: %w", err)
+		return false, fmt.Errorf("extract: %w", err)
 	}
 	if maxItems := builder.MaxItemsPerResource(); maxItems > 0 && len(items) > maxItems {
 		items = items[:maxItems]
 	}
 
 	// Drop any panel embeddings that are no longer present. We do this
-	// inline (not in the pooled phase) so each dashboard's stale rows
-	// are gone before its fresh embeddings land — partial cycle failure
-	// then leaves the dashboard in a self-consistent state.
-	if err := s.cleanupStaleSubresources(ctx, builder, mr.Key.Namespace, mr.Key.Name, items); err != nil {
-		return fmt.Errorf("cleanup stale subresources: %w", err)
+	// inline (per dashboard, before the pooled phase) so each
+	// dashboard's stale rows are gone before its fresh embeddings land.
+	// Partial cycle failure leaves the dashboard in a self-consistent
+	// state.
+	if err := s.cleanupStaleSubresources(ctx, builder, ev.namespace, ev.name, items); err != nil {
+		return false, fmt.Errorf("cleanup stale subresources: %w", err)
 	}
 
+	added := false
 	for _, it := range items {
 		if it.Content == "" {
 			continue
 		}
-		*pending = append(*pending, pendingEmbed{
+		*pooled = append(*pooled, pendingEmbed{
 			proto: vector.Vector{
-				Namespace:       mr.Key.Namespace,
+				Namespace:       ev.namespace,
 				Resource:        builder.Resource(),
 				UID:             it.UID,
 				Title:           it.Title,
 				Subresource:     it.Subresource,
-				ResourceVersion: mr.ResourceVersion,
+				ResourceVersion: ev.rv,
 				Folder:          it.Folder,
 				Content:         it.Content,
 				Metadata:        it.Metadata,
@@ -505,8 +558,9 @@ func (s *Scanner) collectForUpsert(ctx context.Context, builder embed.Builder, m
 			},
 			text: it.Content,
 		})
+		added = true
 	}
-	return nil
+	return added, nil
 }
 
 // embedAndUpsertPooled submits every queued text in one EmbedText call
@@ -587,4 +641,3 @@ func (s *Scanner) cleanupStaleSubresources(ctx context.Context, builder embed.Bu
 	}
 	return nil
 }
-

@@ -68,6 +68,19 @@ func newScannerNoBootstrap(t *testing.T, st *fakeStorage, vec *fakeVector) (*Sca
 	return s, text
 }
 
+// dashEvent builds a pendingEvent with the dashboard group/resource pre-filled.
+func dashEvent(action resourcepb.WatchEvent_Type, ns, name string, rv int64, value []byte) *pendingEvent {
+	return &pendingEvent{
+		action:    action,
+		group:     dashGroup,
+		resource:  dashRes,
+		namespace: ns,
+		name:      name,
+		value:     value,
+		rv:        rv,
+	}
+}
+
 func dashChange(action resourcepb.WatchEvent_Type, ns, name string, rv int64, value []byte) *resource.ModifiedResource {
 	return &resource.ModifiedResource{
 		Action: action,
@@ -288,13 +301,14 @@ func TestScanner_MonotonicCheckpoint(t *testing.T) {
 	require.Equal(t, int64(100), vec.latestRV)
 	require.Equal(t, 1, text.calls)
 
+	// Simulate a watch event for the new write — the scanner enqueues
+	// the event with its payload, so cycle 2 doesn't need to re-list.
 	st.changes = append(st.changes, dashChange(resourcepb.WatchEvent_MODIFIED, "ns", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")))
-	// Simulate a watch event for the new write, which flags ns for the next cycle.
-	s.flagNamespace("ns")
+	s.enqueue(dashEvent(resourcepb.WatchEvent_MODIFIED, "ns", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")))
 	s.runOnce(context.Background())
 
 	require.Len(t, vec.upserts, 2, "second cycle adds one more pooled upsert")
-	assert.Len(t, vec.upserts[1], 1, "only the unseen RV 200 dashboard ended up in cycle 2's batch")
+	assert.Len(t, vec.upserts[1], 1, "only the unseen RV 200 event ended up in cycle 2's batch")
 	require.Equal(t, int64(200), vec.latestRV)
 	require.Equal(t, 2, text.calls, "one embed call per non-empty cycle")
 }
@@ -379,9 +393,10 @@ func TestScanner_Bootstrap_PrefersNamespaceListerCapability(t *testing.T) {
 	assert.Equal(t, int64(200), vec.latestRV)
 }
 
-func TestScanner_Bootstrap_FallsBackOnCapabilityError(t *testing.T) {
-	// NamespaceLister errors → scanner falls back to GetResourceStats,
-	// which derives namespaces from `changes` in the fake.
+func TestScanner_Bootstrap_NamespaceListerError_NoRecovery(t *testing.T) {
+	// NamespaceLister error means bootstrap can't recover missed
+	// writes. The scanner logs and proceeds; only the watch can
+	// surface new activity from this point on.
 	st := &fakeStorage{}
 	st.changes = []*resource.ModifiedResource{
 		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
@@ -391,13 +406,14 @@ func TestScanner_Bootstrap_FallsBackOnCapabilityError(t *testing.T) {
 	s, _ := newScanner(t, st, vec)
 	s.runOnce(context.Background())
 
-	require.Len(t, vec.upserts, 1)
-	assert.Equal(t, int64(100), vec.latestRV)
+	assert.Empty(t, vec.upserts, "no recovery without NamespaceLister")
+	assert.Equal(t, int64(0), vec.latestRV, "checkpoint stays put")
 }
 
-func TestScanner_WatchEvent_FlagsNamespaceAndScansNextCycle(t *testing.T) {
+func TestScanner_WatchEvent_DrivesNextCycle(t *testing.T) {
 	// Storage starts empty → bootstrap finds nothing → cycle 1 is a no-op.
-	// A watch event arrives announcing activity in ns-x; cycle 2 picks it up.
+	// A watch event arrives carrying the payload directly; cycle 2 embeds it
+	// without re-listing storage.
 	st := &fakeStorage{}
 	vec := newFakeVector()
 	s, text := newScannerNoBootstrap(t, st, vec)
@@ -407,19 +423,69 @@ func TestScanner_WatchEvent_FlagsNamespaceAndScansNextCycle(t *testing.T) {
 	require.Empty(t, vec.upserts)
 	require.Equal(t, 0, text.calls, "no work to do on cycle 1")
 
-	// Now activity happens. The change is added to storage AND a watch
-	// event flags the namespace.
-	st.mu.Lock()
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-x", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
-	}
-	st.mu.Unlock()
-	s.flagNamespace("ns-x")
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns-x", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")))
 
 	s.runOnce(context.Background())
-	require.Len(t, vec.upserts, 1, "cycle 2 finds the watch-flagged namespace")
+	require.Len(t, vec.upserts, 1, "cycle 2 picks up the watch event")
 	assert.Equal(t, 1, text.calls)
 	assert.Equal(t, int64(100), vec.latestRV)
+}
+
+func TestScanner_EnqueueDedup_KeepsHighestRV(t *testing.T) {
+	// Two events for the same dashboard at different RVs. Only the
+	// highest RV's content should be embedded.
+	st := &fakeStorage{}
+	vec := newFakeVector()
+	s, text := newScannerNoBootstrap(t, st, vec)
+
+	// Older RV first.
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "Old Title")))
+	// Newer RV — wins.
+	s.enqueue(dashEvent(resourcepb.WatchEvent_MODIFIED, "ns", "dash", 200, minimalDashboard("dash", "New Title")))
+	// Older RV arriving after newer (replay scenario) — dropped.
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "Old Again")))
+
+	s.runOnce(context.Background())
+	assert.Equal(t, 1, text.calls, "single embed call")
+	require.Len(t, vec.upserts, 1)
+	require.Len(t, vec.upserts[0], 1, "only the highest-RV event was embedded")
+	assert.Equal(t, int64(200), vec.upserts[0][0].ResourceVersion)
+	assert.Equal(t, int64(200), vec.latestRV)
+}
+
+func TestScanner_EnqueueDedup_DeleteOverridesOlderUpsert(t *testing.T) {
+	// A delete at a higher RV must beat an earlier upsert for the same resource.
+	st := &fakeStorage{}
+	vec := newFakeVector()
+	s, _ := newScannerNoBootstrap(t, st, vec)
+
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "Title")))
+	s.enqueue(dashEvent(resourcepb.WatchEvent_DELETED, "ns", "dash", 200, nil))
+
+	s.runOnce(context.Background())
+	assert.Empty(t, vec.upserts, "older upsert was overridden by the newer delete")
+	require.Len(t, vec.deletes, 1)
+	assert.Equal(t, "dash", vec.deletes[0].UID)
+	assert.Equal(t, int64(200), vec.latestRV)
+}
+
+func TestScanner_CursorFiltersAlreadyProcessedEvents(t *testing.T) {
+	// Pre-set the checkpoint to 150. Any event with RV ≤ 150 must be
+	// dropped at the cursor check.
+	st := &fakeStorage{}
+	vec := newFakeVector()
+	vec.latestRV = 150
+	s, text := newScannerNoBootstrap(t, st, vec)
+
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "old", 100, minimalDashboard("old", "Old"))) // already processed
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "new", 200, minimalDashboard("new", "New")))
+
+	s.runOnce(context.Background())
+	assert.Equal(t, 1, text.calls)
+	require.Len(t, vec.upserts, 1)
+	require.Len(t, vec.upserts[0], 1, "only the post-cursor event embedded")
+	assert.Equal(t, "new", vec.upserts[0][0].UID)
+	assert.Equal(t, int64(200), vec.latestRV)
 }
 
 func TestScanner_WatchConsumer_IgnoresUnrelatedResources(t *testing.T) {
@@ -435,7 +501,6 @@ func TestScanner_WatchConsumer_IgnoresUnrelatedResources(t *testing.T) {
 	require.NoError(t, err)
 	go s.consumeWatchEvents(ctx, ch)
 
-	// Push two events: one for folders (ignored), one for dashboards (flagged).
 	st.emit(&resource.WrittenEvent{
 		Type: resourcepb.WatchEvent_ADDED,
 		Key: &resourcepb.ResourceKey{
@@ -448,21 +513,25 @@ func TestScanner_WatchConsumer_IgnoresUnrelatedResources(t *testing.T) {
 		Key: &resourcepb.ResourceKey{
 			Group: dashGroup, Resource: dashRes, Namespace: "ns-y", Name: "d1",
 		},
+		Value:           minimalDashboard("d1", "Dash 1"),
 		ResourceVersion: 60,
 	})
-	// Tiny synchronous wait by polling the set instead of sleeping.
+
+	dashKey := eventQueueKey(dashGroup, dashRes, "ns-y", "d1")
+	folderKey := eventQueueKey("folder.grafana.app", "folders", "ns-x", "f1")
+
 	require.Eventually(t, func() bool {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		_, ok := s.nsToScan["ns-y"]
-		_, dropped := s.nsToScan["ns-x"]
-		return ok && !dropped
+		s.queueMu.Lock()
+		defer s.queueMu.Unlock()
+		_, dashboardQueued := s.queue[dashKey]
+		_, folderQueued := s.queue[folderKey]
+		return dashboardQueued && !folderQueued
 	}, time.Second, 10*time.Millisecond)
 }
 
-func TestScanner_PooledFailure_ReFlagsNamespaces(t *testing.T) {
-	// On a pooled failure, the scanner must re-flag the drained
-	// namespaces so the next cycle retries them.
+func TestScanner_PooledFailure_ReEnqueuesSourceEvents(t *testing.T) {
+	// On a pooled failure, every source event that contributed must
+	// land back on the queue so the next cycle retries it.
 	st := &fakeStorage{}
 	st.changes = []*resource.ModifiedResource{
 		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
@@ -474,15 +543,17 @@ func TestScanner_PooledFailure_ReFlagsNamespaces(t *testing.T) {
 	s.runOnce(context.Background())
 
 	assert.Empty(t, vec.upserts)
-	assert.Equal(t, int64(99), vec.latestRV, "pooled failure pins target to lowest RV - 1")
+	assert.Equal(t, int64(99), vec.latestRV, "pooled failure pins target to lowest pending RV - 1")
 
-	// Both namespaces should be back in the set, awaiting retry.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, hasA := s.nsToScan["ns-a"]
-	_, hasB := s.nsToScan["ns-b"]
-	assert.True(t, hasA, "ns-a re-flagged after pooled failure")
-	assert.True(t, hasB, "ns-b re-flagged after pooled failure")
+	keyA := eventQueueKey(dashGroup, dashRes, "ns-a", "dash-1")
+	keyB := eventQueueKey(dashGroup, dashRes, "ns-b", "dash-2")
+
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	_, hasA := s.queue[keyA]
+	_, hasB := s.queue[keyB]
+	assert.True(t, hasA, "dash-1 re-enqueued after pooled failure")
+	assert.True(t, hasB, "dash-2 re-enqueued after pooled failure")
 }
 
 func TestChooseTarget(t *testing.T) {
