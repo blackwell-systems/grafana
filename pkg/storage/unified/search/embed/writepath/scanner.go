@@ -51,6 +51,18 @@ import (
 // there is no work or the lock is held by another replica.
 const DefaultPollInterval = 30 * time.Second
 
+// maxEventAttempts caps how many cycles we'll keep retrying a single
+// failing event before giving up on it. With the default 30s poll
+// interval that's roughly 5 minutes — long enough to ride out
+// transient embedder/Vertex hiccups, short enough that a permanently
+// broken dashboard doesn't block cursor advancement indefinitely.
+//
+// "Giving up" means the event is dropped without pinning
+// lowestFailedRv, so the cursor can move past it. The dashboard's
+// vector stays whatever it was; a future write to the same dashboard
+// (at a higher RV) resets the attempt budget via the enqueue dedup.
+const maxEventAttempts = 10
+
 // NamespaceLister is the capability backends must implement so the
 // scanner can bootstrap without walking every namespace. Both the SQL
 // and KV backends implement it; the scanner refuses to recover missed
@@ -72,6 +84,10 @@ type pendingEvent struct {
 	name      string
 	value     []byte // payload for upserts; nil/empty for deletes
 	rv        int64
+	// attempts counts how many cycles have tried to process this event.
+	// Incremented at the start of each attempt; once it reaches
+	// maxEventAttempts the event is dropped without pinning the cursor.
+	attempts int
 }
 
 // eventQueueKey is the dedup key — one pending event per resource at a
@@ -529,16 +545,18 @@ func (s *Scanner) processQueue(ctx context.Context) {
 			continue
 		}
 
+		// Attempt budget: count this try before processing. recordFailure
+		// (below) inspects the post-increment value to decide whether to
+		// re-enqueue or give up.
+		ev.attempts++
+
 		switch ev.action {
 		case resourcepb.WatchEvent_DELETED:
 			if err := s.vectorBackend.Delete(ctx, ev.namespace, s.embedder.Model, builder.Resource(), ev.name); err != nil {
 				logger.Warn("writepath: delete vector",
 					"namespace", ev.namespace, "name", ev.name,
-					"rv", ev.rv, "err", err)
-				failed = append(failed, ev)
-				if ev.rv < lowestFailedRv {
-					lowestFailedRv = ev.rv
-				}
+					"rv", ev.rv, "attempts", ev.attempts, "err", err)
+				lowestFailedRv = s.recordFailure(ev, &failed, lowestFailedRv, logger, "delete")
 				continue
 			}
 			successes = append(successes, ev)
@@ -548,11 +566,8 @@ func (s *Scanner) processQueue(ctx context.Context) {
 			if err != nil {
 				logger.Warn("writepath: collect event",
 					"namespace", ev.namespace, "name", ev.name,
-					"rv", ev.rv, "err", err)
-				failed = append(failed, ev)
-				if ev.rv < lowestFailedRv {
-					lowestFailedRv = ev.rv
-				}
+					"rv", ev.rv, "attempts", ev.attempts, "err", err)
+				lowestFailedRv = s.recordFailure(ev, &failed, lowestFailedRv, logger, "collect")
 				continue
 			}
 			if added {
@@ -566,10 +581,7 @@ func (s *Scanner) processQueue(ctx context.Context) {
 			logger.Warn("writepath: unknown action",
 				"namespace", ev.namespace, "name", ev.name,
 				"rv", ev.rv, "action", ev.action)
-			failed = append(failed, ev)
-			if ev.rv < lowestFailedRv {
-				lowestFailedRv = ev.rv
-			}
+			lowestFailedRv = s.recordFailure(ev, &failed, lowestFailedRv, logger, "unknown-action")
 			continue
 		}
 		if ev.rv > maxRv {
@@ -583,11 +595,11 @@ func (s *Scanner) processQueue(ctx context.Context) {
 		if err := s.embedAndUpsertPooled(ctx, pooled); err != nil {
 			logger.Error("writepath: pooled embed/upsert",
 				"items", len(pooled), "sources", len(pooledSources), "err", err)
+			// attempts was already incremented when each source was
+			// collected, so recordFailure inspects the same post-increment
+			// value as for solo failures.
 			for _, ev := range pooledSources {
-				failed = append(failed, ev)
-				if ev.rv < lowestFailedRv {
-					lowestFailedRv = ev.rv
-				}
+				lowestFailedRv = s.recordFailure(ev, &failed, lowestFailedRv, logger, "pooled-embed")
 			}
 		} else {
 			successes = append(successes, pooledSources...)
@@ -641,6 +653,25 @@ func (s *Scanner) requeue(events []*pendingEvent) {
 	for _, ev := range events {
 		s.enqueue(ev)
 	}
+}
+
+// recordFailure handles a per-event processing failure. ev.attempts must
+// already be incremented before calling. If the event has exhausted its
+// attempt budget it's logged and dropped — the cursor is allowed to
+// advance past it. Otherwise it joins the `failed` slice for
+// re-enqueueing and pins the cursor below its RV.
+func (s *Scanner) recordFailure(ev *pendingEvent, failed *[]*pendingEvent, lowestFailedRv int64, logger log.Logger, op string) int64 {
+	if ev.attempts >= maxEventAttempts {
+		logger.Error("writepath: dropping event past retry cap; cursor will advance past it",
+			"namespace", ev.namespace, "name", ev.name,
+			"rv", ev.rv, "attempts", ev.attempts, "op", op)
+		return lowestFailedRv
+	}
+	*failed = append(*failed, ev)
+	if ev.rv < lowestFailedRv {
+		return ev.rv
+	}
+	return lowestFailedRv
 }
 
 // collectUpsertEvent extracts items from one event's payload, runs

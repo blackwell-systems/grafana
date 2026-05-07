@@ -638,6 +638,83 @@ func TestScanner_BackfillForDifferentResource_DoesNotBlock(t *testing.T) {
 	assert.Equal(t, int64(100), vec.latestRV)
 }
 
+func TestScanner_RetryCap_DropsEventAfterMaxAttempts(t *testing.T) {
+	// A permanently-failing event eventually exhausts its attempts. On
+	// the give-up cycle the failure no longer pins lowestFailedRv, so
+	// the cursor advances past its RV — which is the whole point.
+	st := &fakeStorage{}
+	vec := newFakeVector()
+	vec.upsertErr = errBoom
+	s, _ := newScannerNoBootstrap(t, st, vec)
+
+	ev := dashEvent(resourcepb.WatchEvent_ADDED, "ns", "boom", 100, minimalDashboard("boom", "Boom"))
+	s.enqueue(ev)
+
+	for i := 0; i < maxEventAttempts; i++ {
+		s.runOnce(context.Background())
+	}
+
+	require.Equal(t, 0, s.queueLen(), "event dropped after exhausting attempts")
+	assert.Empty(t, vec.upserts, "every attempt failed; nothing was embedded")
+	assert.Equal(t, int64(100), vec.latestRV, "cursor advanced past the dropped event")
+
+	// A subsequent healthy event proves the scanner is unblocked.
+	vec.upsertErr = nil
+	s.enqueue(dashEvent(resourcepb.WatchEvent_MODIFIED, "ns-other", "ok", 200, minimalDashboard("ok", "OK")))
+	s.runOnce(context.Background())
+
+	require.Len(t, vec.upserts, 1)
+	assert.Equal(t, int64(200), vec.latestRV)
+}
+
+func TestScanner_RetryCap_FreshHigherRVResetsBudget(t *testing.T) {
+	// A new write at a higher RV for the same dashboard replaces the
+	// failing event and gets a fresh attempt budget.
+	st := &fakeStorage{}
+	vec := newFakeVector()
+	s, _ := newScannerNoBootstrap(t, st, vec)
+
+	// First, a failing event that's burned several attempts.
+	failingEv := dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "v1"))
+	failingEv.attempts = maxEventAttempts - 1 // simulate prior cycles
+	s.enqueue(failingEv)
+
+	// New write to the same dashboard at a higher RV — fresh event,
+	// attempts=0 by default. Dedup should replace the older one and
+	// reset the budget.
+	freshEv := dashEvent(resourcepb.WatchEvent_MODIFIED, "ns", "dash", 200, minimalDashboard("dash", "v2"))
+	s.enqueue(freshEv)
+
+	// One cycle succeeds (no upsertErr), so attempts=0+1=1, well under cap.
+	s.runOnce(context.Background())
+
+	require.Len(t, vec.upserts, 1, "fresh higher-RV event processed")
+	assert.Equal(t, int64(200), vec.upserts[0][0].ResourceVersion)
+	assert.Equal(t, int64(200), vec.latestRV)
+}
+
+func TestScanner_RetryCap_ReEnqueuePreservesAttempts(t *testing.T) {
+	// One failing cycle bumps attempts to 1; the re-enqueued event
+	// keeps that count rather than resetting.
+	st := &fakeStorage{}
+	vec := newFakeVector()
+	vec.upsertErr = errBoom
+	s, _ := newScannerNoBootstrap(t, st, vec)
+
+	ev := dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "v1"))
+	s.enqueue(ev)
+
+	s.runOnce(context.Background())
+	require.Equal(t, 1, s.queueLen(), "event re-enqueued after first failure")
+
+	// Inspect the queued event directly: same pointer should be back.
+	s.queueMu.Lock()
+	queued := s.queue[eventQueueKey(dashGroup, dashRes, "ns", "dash")]
+	s.queueMu.Unlock()
+	require.NotNil(t, queued)
+	assert.Equal(t, 1, queued.attempts, "first attempt recorded")
+}
+
 func TestChooseTarget(t *testing.T) {
 	const noFail = int64(1<<63 - 1)
 	cases := []struct {
