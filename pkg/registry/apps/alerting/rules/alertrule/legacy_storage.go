@@ -31,7 +31,7 @@ func onlyAlertingVersions(versions []*ngmodels.AlertRuleVersion) []*ngmodels.Ale
 		if v == nil {
 			continue
 		}
-		if v.AlertRule.Type() != ngmodels.RuleTypeAlerting {
+		if v.Type() != ngmodels.RuleTypeAlerting {
 			continue
 		}
 		out = append(out, v)
@@ -117,6 +117,8 @@ func (s *legacyStorage) List(ctx context.Context, opts *internalversion.ListOpti
 			return nil, err
 		}
 		return convertDeletedToK8sResources(info.OrgID, onlyAlertingRules(deleted), s.namespacer)
+	case common.ListModeNormal:
+		// fall through to the normal list pipeline below.
 	}
 
 	groupFilter, err := common.ParseLabelSelectorFilter(opts.LabelSelector, model.GroupLabelKey)
