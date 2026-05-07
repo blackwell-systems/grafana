@@ -191,7 +191,22 @@ func ProvideUnifiedStorageGrpcService(cfg *setting.Cfg,
 			services.NewBasicService(nil, bf.Run, nil).WithName("vector-backfiller"))
 	}
 
-	scanner, err := writepath.ProvideScanner(cfg, backend, vectorBackend, embedderInstance)
+	// Reuse the resource server's WriteWriteEvents broadcaster instead
+	// of opening a parallel WatchWriteEvents subscription. The server is
+	// constructed below in registerServer; the closure captures `s` and
+	// resolves the broadcaster lazily at scanner.Run() time.
+	subscribeWriteEvents := func(ctx context.Context, name string) (<-chan *resource.WrittenEvent, func(), error) {
+		bs, ok := s.serverStopper.(resource.WriteEventsBroadcaster)
+		if !ok || bs == nil {
+			return nil, nil, fmt.Errorf("write-events broadcaster unavailable")
+		}
+		ch, err := bs.SubscribeWriteEvents(ctx, name)
+		if err != nil {
+			return nil, nil, err
+		}
+		return ch, func() { bs.UnsubscribeWriteEvents(ch) }, nil
+	}
+	scanner, err := writepath.ProvideScanner(cfg, backend, vectorBackend, embedderInstance, subscribeWriteEvents)
 	if err != nil {
 		return nil, fmt.Errorf("create vector write-path scanner: %w", err)
 	}

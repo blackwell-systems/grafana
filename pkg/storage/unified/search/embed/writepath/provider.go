@@ -14,11 +14,16 @@ import (
 // when the feature is disabled or any required dep is missing — same
 // pattern as backfill.ProvideVectorBackfiller, so callers must tolerate
 // a nil result.
+//
+// `subscribe` is the write-event source. The standard wiring resolves
+// it to the resource server's broadcaster lazily so the server has had
+// a chance to initialise before the scanner subscribes.
 func ProvideScanner(
 	cfg *setting.Cfg,
 	storage resource.StorageBackend,
 	vb vector.VectorBackend,
 	emb *embedder.Embedder,
+	subscribe SubscribeFunc,
 ) (*Scanner, error) {
 	if cfg == nil || !cfg.VectorBackfillerEnabled {
 		return nil, nil
@@ -26,7 +31,7 @@ func ProvideScanner(
 	if cfg.EmbeddingProvider == "" {
 		return nil, nil
 	}
-	if storage == nil || vb == nil || emb == nil {
+	if storage == nil || vb == nil || emb == nil || subscribe == nil {
 		return nil, nil
 	}
 	return New(Options{
@@ -34,6 +39,7 @@ func ProvideScanner(
 		VectorBackend: vb,
 		Embedder:      emb,
 		Builders:      []embed.Builder{dashboard.New()},
+		Subscribe:     subscribe,
 		Log:           log.New("writepath"),
 	})
 }

@@ -1527,6 +1527,34 @@ func (s *server) initWatcher() error {
 	return nil
 }
 
+// WriteEventsBroadcaster is the in-process write-event fan-out exposed
+// by the resource server. The single source of truth for write events
+// is one StorageBackend.WatchWriteEvents subscription managed inside
+// the server; multiple consumers (gRPC Watch clients, the vector
+// write-path scanner) subscribe to the broadcaster instead of opening
+// parallel WatchWriteEvents calls.
+//
+// Returns an error if the server's broadcaster hasn't been initialised
+// yet (i.e. before Init has run).
+type WriteEventsBroadcaster interface {
+	SubscribeWriteEvents(ctx context.Context, name string) (<-chan *WrittenEvent, error)
+	UnsubscribeWriteEvents(ch <-chan *WrittenEvent)
+}
+
+func (s *server) SubscribeWriteEvents(ctx context.Context, name string) (<-chan *WrittenEvent, error) {
+	if s.broadcaster == nil {
+		return nil, fmt.Errorf("write-events broadcaster not initialised")
+	}
+	return s.broadcaster.Subscribe(ctx, name)
+}
+
+func (s *server) UnsubscribeWriteEvents(ch <-chan *WrittenEvent) {
+	if s.broadcaster == nil || ch == nil {
+		return
+	}
+	s.broadcaster.Unsubscribe(ch)
+}
+
 //nolint:gocyclo
 func (s *server) Watch(req *resourcepb.WatchRequest, srv resourcepb.ResourceStore_WatchServer) error {
 	ctx := srv.Context()

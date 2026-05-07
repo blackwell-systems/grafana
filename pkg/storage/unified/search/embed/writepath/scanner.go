@@ -80,6 +80,16 @@ func eventQueueKey(group, resource, namespace, name string) string {
 	return group + "/" + resource + "/" + namespace + "/" + name
 }
 
+// SubscribeFunc attaches the scanner to a write-event stream. Returning
+// a nil channel and a no-op release disables the watch path entirely
+// (useful in tests) — bootstrap alone keeps the index correct, just
+// without the per-write nudge.
+//
+// Called at scanner.Run() time, not at construction, so the underlying
+// resource server has had a chance to initialise its broadcaster
+// before the scanner actually subscribes.
+type SubscribeFunc func(ctx context.Context, name string) (<-chan *resource.WrittenEvent, func(), error)
+
 type Options struct {
 	Storage       resource.StorageBackend
 	VectorBackend vector.VectorBackend
@@ -87,6 +97,9 @@ type Options struct {
 	Builders      []embed.Builder
 	PollInterval  time.Duration
 	Log           log.Logger
+
+	// Subscribe is the write-event source. Required.
+	Subscribe SubscribeFunc
 }
 
 // Scanner is the write-path indexer. One per process; coordinated across
@@ -96,6 +109,7 @@ type Scanner struct {
 	vectorBackend vector.VectorBackend
 	embedder      *embedder.Embedder
 	builders      map[string]embed.Builder // keyed by resource
+	subscribe     SubscribeFunc
 	pollInterval  time.Duration
 	log           log.Logger
 
@@ -122,6 +136,9 @@ func New(opts Options) (*Scanner, error) {
 	if len(opts.Builders) == 0 {
 		return nil, fmt.Errorf("writepath: at least one Builder is required")
 	}
+	if opts.Subscribe == nil {
+		return nil, fmt.Errorf("writepath: Subscribe is required")
+	}
 	builders := make(map[string]embed.Builder, len(opts.Builders))
 	for _, b := range opts.Builders {
 		if _, dup := builders[b.Resource()]; dup {
@@ -140,6 +157,7 @@ func New(opts Options) (*Scanner, error) {
 		vectorBackend: opts.VectorBackend,
 		embedder:      opts.Embedder,
 		builders:      builders,
+		subscribe:     opts.Subscribe,
 		pollInterval:  opts.PollInterval,
 		log:           opts.Log,
 		queue:         make(map[string]*pendingEvent),
@@ -185,19 +203,22 @@ func (s *Scanner) drainQueue() []*pendingEvent {
 	return out
 }
 
-// Run subscribes to write events, bootstraps the namespace set, then
-// runs the periodic drain-and-scan loop until ctx is cancelled.
+// Run subscribes to write events, bootstraps the queue, then runs the
+// periodic drain-and-scan loop until ctx is cancelled.
 func (s *Scanner) Run(ctx context.Context) error {
 	logger := s.log.FromContext(ctx)
 
-	// Subscribe early so events flagged during bootstrap aren't lost.
-	ch, err := s.storage.WatchWriteEvents(ctx)
+	// Subscribe early so events arriving during bootstrap aren't lost.
+	// The broadcaster's ring-buffer cache replays recent events to the
+	// new subscriber, which gives us a small natural overlap between
+	// "what we caught with bootstrap" and "what watch tells us next".
+	ch, release, err := s.subscribe(ctx, "vector-write-scanner")
 	if err != nil {
 		logger.Error("writepath: subscribe to write events", "err", err)
-		// Watch failure isn't fatal; the periodic poll alone still works
-		// (with the bootstrap path repeating each cycle, which is wasteful
-		// but correct). Carry on without the watch.
-	} else {
+		// Subscribe failure isn't fatal; the periodic loop still works
+		// from bootstrap output, just without per-write nudges.
+	} else if ch != nil {
+		defer release()
 		go s.consumeWatchEvents(ctx, ch)
 	}
 
