@@ -1,7 +1,16 @@
 // Package writepath keeps the vector index in sync with ongoing dashboard
-// writes. A periodic scanner reads StorageBackend.ListModifiedSince since
-// the vector_latest_rv checkpoint, embeds new/modified dashboards, deletes
-// vectors for tombstones, and advances the checkpoint.
+// writes. A periodic scanner enumerates active namespaces via
+// GetResourceStats and, for each one, reads StorageBackend.ListModifiedSince
+// since the vector_latest_rv checkpoint, embeds new/modified dashboards,
+// deletes vectors for tombstones, and advances the checkpoint.
+//
+// The per-namespace fan-out is intentional: ListModifiedSince's existing
+// contract requires a non-empty namespace, so the scanner does the
+// fan-out itself rather than push cross-namespace semantics into the
+// storage backend. With a 30s cycle and a few-thousand namespaces ceiling
+// at Grafana scale, the extra round-trips per cycle are cheap. If that
+// stops being true, swap to a single cross-namespace ListModifiedSince
+// (see commit history for an earlier draft).
 //
 // The scanner is the sole writer of vector_latest_rv. The backfiller has
 // its own state (vector_backfill_jobs) and may run concurrently; both
@@ -130,8 +139,9 @@ func (s *Scanner) runOnce(ctx context.Context) {
 	}
 }
 
-// scanBuilder runs one cross-namespace ListModifiedSince + process pass
-// for the given builder and advances vector_latest_rv on success.
+// scanBuilder enumerates active namespaces and runs one
+// ListModifiedSince + process pass per namespace, then advances
+// vector_latest_rv based on the global outcome.
 func (s *Scanner) scanBuilder(ctx context.Context, builder embed.Builder) {
 	logger := s.log.FromContext(ctx).New("group", builder.Group(), "resource", builder.Resource())
 
@@ -147,24 +157,75 @@ func (s *Scanner) scanBuilder(ctx context.Context, builder embed.Builder) {
 		effectiveSince = 1
 	}
 
-	key := resource.NamespacedResource{
+	stats, err := s.storage.GetResourceStats(ctx, resource.NamespacedResource{
 		Group:    builder.Group(),
 		Resource: builder.Resource(),
-		// Namespace intentionally empty — cross-namespace scan.
+		// Namespace empty = enumerate all.
+	}, 0)
+	if err != nil {
+		logger.Error("writepath: enumerate namespaces", "err", err)
+		return
 	}
-	latestRv, seq := s.storage.ListModifiedSince(ctx, key, effectiveSince, nil)
+
+	// Aggregate across namespaces. vector_latest_rv is a single global
+	// cursor and storage RVs are globally monotonic, so we collapse
+	// per-namespace progress into one (sinceRv, latestRv, lowestFailedRv)
+	// triple and feed it to chooseTarget once.
+	lowestFailedRv := int64(math.MaxInt64)
+	var maxLatestRv int64
+	processed := 0
+	for _, st := range stats {
+		if ctx.Err() != nil {
+			return
+		}
+		if st.Namespace == "" {
+			continue
+		}
+		nsLatest, nsProcessed, nsLowestFailed := s.scanNamespace(ctx, builder, st.Namespace, effectiveSince, logger)
+		if nsLatest > maxLatestRv {
+			maxLatestRv = nsLatest
+		}
+		if nsLowestFailed < lowestFailedRv {
+			lowestFailedRv = nsLowestFailed
+		}
+		processed += nsProcessed
+	}
+
+	target := chooseTarget(sinceRv, maxLatestRv, lowestFailedRv)
+	if target > sinceRv {
+		if err := s.vectorBackend.SetLatestRV(ctx, target); err != nil {
+			logger.Error("writepath: advance checkpoint", "err", err, "target", target)
+			return
+		}
+	}
+	if processed > 0 || target > sinceRv {
+		logger.Debug("writepath: cycle complete",
+			"namespaces", len(stats), "processed", processed, "from", sinceRv, "to", target)
+	}
+}
+
+// scanNamespace processes one namespace's slice of changes. Returns the
+// latestRv reported by the backend, the count of successful items, and
+// the lowest RV that failed (math.MaxInt64 if none failed).
+func (s *Scanner) scanNamespace(ctx context.Context, builder embed.Builder, namespace string, sinceRv int64, logger log.Logger) (int64, int, int64) {
+	key := resource.NamespacedResource{
+		Namespace: namespace,
+		Group:     builder.Group(),
+		Resource:  builder.Resource(),
+	}
+	latestRv, seq := s.storage.ListModifiedSince(ctx, key, sinceRv, nil)
 
 	lowestFailedRv := int64(math.MaxInt64)
 	processed := 0
 	for mr, iterErr := range seq {
 		if ctx.Err() != nil {
-			return
+			return latestRv, processed, lowestFailedRv
 		}
 		if iterErr != nil {
-			logger.Error("writepath: iterator error", "err", iterErr)
-			// Treat as a global failure: don't advance the checkpoint at all.
-			lowestFailedRv = effectiveSince
-			break
+			logger.Error("writepath: iterator error", "namespace", namespace, "err", iterErr)
+			// Treat the whole namespace as failed at sinceRv so the
+			// global advance stays put.
+			return latestRv, processed, sinceRv
 		}
 		if mr == nil {
 			continue
@@ -182,18 +243,7 @@ func (s *Scanner) scanBuilder(ctx context.Context, builder embed.Builder) {
 		}
 		processed++
 	}
-
-	target := chooseTarget(sinceRv, latestRv, lowestFailedRv)
-	if target > sinceRv {
-		if err := s.vectorBackend.SetLatestRV(ctx, target); err != nil {
-			logger.Error("writepath: advance checkpoint", "err", err, "target", target)
-			return
-		}
-	}
-	if processed > 0 || target > sinceRv {
-		logger.Debug("writepath: cycle complete",
-			"processed", processed, "from", sinceRv, "to", target)
-	}
+	return latestRv, processed, lowestFailedRv
 }
 
 // chooseTarget picks the highest checkpoint we can safely advance to:

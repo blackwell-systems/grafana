@@ -20,6 +20,7 @@ type fakeStorage struct {
 	mu       sync.Mutex
 	changes  []*resource.ModifiedResource
 	listErr  error
+	statsErr error
 	itemErr  error // returned from the iterator partway through
 	itemErrI int   // index after which to inject itemErr
 }
@@ -39,8 +40,43 @@ func (f *fakeStorage) ListHistory(context.Context, *resourcepb.ListRequest, func
 func (f *fakeStorage) WatchWriteEvents(context.Context) (<-chan *resource.WrittenEvent, error) {
 	panic("not implemented")
 }
-func (f *fakeStorage) GetResourceStats(context.Context, resource.NamespacedResource, int) ([]resource.ResourceStats, error) {
-	panic("not implemented")
+// GetResourceStats returns one ResourceStats per distinct
+// (namespace, group, resource) seen in `changes`. The scanner uses this
+// to enumerate active namespaces, so the fake derives the set from the
+// configured changes rather than maintaining a separate registry.
+func (f *fakeStorage) GetResourceStats(_ context.Context, nsr resource.NamespacedResource, _ int) ([]resource.ResourceStats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.statsErr != nil {
+		return nil, f.statsErr
+	}
+	seen := map[string]resource.ResourceStats{}
+	for _, c := range f.changes {
+		if c.Key.Group != nsr.Group || c.Key.Resource != nsr.Resource {
+			continue
+		}
+		k := c.Key.Namespace
+		s, ok := seen[k]
+		if !ok {
+			s = resource.ResourceStats{
+				NamespacedResource: resource.NamespacedResource{
+					Namespace: c.Key.Namespace,
+					Group:     c.Key.Group,
+					Resource:  c.Key.Resource,
+				},
+			}
+		}
+		s.Count++
+		if c.ResourceVersion > s.ResourceVersion {
+			s.ResourceVersion = c.ResourceVersion
+		}
+		seen[k] = s
+	}
+	out := make([]resource.ResourceStats, 0, len(seen))
+	for _, s := range seen {
+		out = append(out, s)
+	}
+	return out, nil
 }
 func (f *fakeStorage) GetResourceLastImportTimes(context.Context) iter.Seq2[resource.ResourceLastImportTime, error] {
 	panic("not implemented")
@@ -57,11 +93,21 @@ func (f *fakeStorage) ListModifiedSince(_ context.Context, key resource.Namespac
 	}
 	// Snapshot the slice + per-iteration error config so the iterator
 	// closes over a stable view. The scanner runs the iter outside the
-	// lock, and the test may mutate state afterwards.
+	// lock, and the test may mutate state afterwards. Single-namespace
+	// contract: callers must pass a non-empty namespace.
+	if key.Namespace == "" {
+		err := errors.New("fakeStorage.ListModifiedSince: namespace is required")
+		return 0, func(yield func(*resource.ModifiedResource, error) bool) {
+			yield(nil, err)
+		}
+	}
 	matches := make([]*resource.ModifiedResource, 0, len(f.changes))
 	var latestRv int64
 	for _, c := range f.changes {
 		if c.Key.Group != key.Group || c.Key.Resource != key.Resource {
+			continue
+		}
+		if c.Key.Namespace != key.Namespace {
 			continue
 		}
 		if c.ResourceVersion <= sinceRv {

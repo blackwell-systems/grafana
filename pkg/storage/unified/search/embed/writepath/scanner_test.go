@@ -254,6 +254,62 @@ func TestScanner_UnknownAction_TreatedAsFailure(t *testing.T) {
 	assert.Equal(t, int64(49), vec.latestRV)
 }
 
+func TestScanner_MultiNamespace_ProcessesEachAndAdvancesToMaxRV(t *testing.T) {
+	// Two namespaces, one resource each. Fan-out must produce two
+	// upserts and advance to the highest RV seen.
+	st := &fakeStorage{}
+	st.changes = []*resource.ModifiedResource{
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash A")),
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-b", "dash-2", 200, minimalDashboard("dash-2", "Dash B")),
+	}
+	vec := newFakeVector()
+	s := newScanner(t, st, vec)
+
+	s.runOnce(context.Background())
+
+	require.Len(t, vec.upserts, 2)
+	assert.Equal(t, int64(200), vec.latestRV)
+}
+
+func TestScanner_MultiNamespace_FailureInOneNamespaceBlocksGlobalAdvance(t *testing.T) {
+	// Namespace A has a failing dashboard at RV 100. Namespace B is
+	// healthy with RV 200. Global checkpoint must stop at 99 so A's
+	// failure is retried, even though everything in B succeeded.
+	st := &fakeStorage{}
+	st.changes = []*resource.ModifiedResource{
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "boom", 100, minimalDashboard("boom", "Boom")),
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-b", "ok", 200, minimalDashboard("ok", "OK")),
+	}
+	vec := newFakeVector()
+	vec.upsertErrFn = func(vs []vector.Vector) error {
+		for _, v := range vs {
+			if v.UID == "boom" {
+				return errBoom
+			}
+		}
+		return nil
+	}
+	s := newScanner(t, st, vec)
+	s.runOnce(context.Background())
+
+	require.Len(t, vec.upserts, 1, "ns-b succeeds; ns-a fails")
+	assert.Equal(t, int64(99), vec.latestRV, "global advance stops at lowest failure - 1")
+}
+
+func TestScanner_NoNamespacesActive_NoOp(t *testing.T) {
+	// GetResourceStats returns empty (no dashboards anywhere yet); the
+	// scanner should run cleanly without making list calls.
+	st := &fakeStorage{}
+	vec := newFakeVector()
+	s := newScanner(t, st, vec)
+
+	s.runOnce(context.Background())
+
+	assert.Empty(t, vec.upserts)
+	assert.Empty(t, vec.deletes)
+	assert.Equal(t, int64(0), vec.latestRV)
+}
+
 func TestChooseTarget(t *testing.T) {
 	const noFail = int64(1<<63 - 1)
 	cases := []struct {

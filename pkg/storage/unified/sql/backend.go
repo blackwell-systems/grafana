@@ -1118,15 +1118,12 @@ func (b *backend) ListModifiedSince(ctx context.Context, key resource.Namespaced
 				continue
 			}
 
-			// Deduplicate by (namespace, name). When the caller passes an
-			// empty namespace, this query is cross-namespace, so two
-			// resources with the same name in different namespaces must
-			// not collapse into one entry.
-			dedupKey := mr.Key.Namespace + "/" + mr.Key.Name
-			if _, ok := seen[dedupKey]; ok {
+			// Deduplicate by name (namespace, group, and resource are always the same in the result set)
+			if _, ok := seen[mr.Key.Name]; ok {
 				continue
 			}
-			seen[dedupKey] = struct{}{}
+
+			seen[mr.Key.Name] = struct{}{}
 			if !yield(mr, nil) {
 				return
 			}

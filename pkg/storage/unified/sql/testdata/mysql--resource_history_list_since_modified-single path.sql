@@ -7,8 +7,7 @@ SELECT
     `action`,
     `value`
 FROM resource_history
-WHERE
-  `namespace` = 'ns'
+WHERE `namespace` = 'ns'
   AND `group` = 'group'
   AND `resource` = 'res'
   AND `resource_version` > 10000 
