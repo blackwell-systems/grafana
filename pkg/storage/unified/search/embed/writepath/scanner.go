@@ -208,6 +208,15 @@ func (s *Scanner) drainQueue() []*pendingEvent {
 func (s *Scanner) Run(ctx context.Context) error {
 	logger := s.log.FromContext(ctx)
 
+	resources := make([]string, 0, len(s.builders))
+	for r := range s.builders {
+		resources = append(resources, r)
+	}
+	logger.Info("writepath: scanner starting",
+		"model", s.embedder.Model,
+		"resources", resources,
+		"poll_interval", s.pollInterval)
+
 	// Subscribe early so events arriving during bootstrap aren't lost.
 	// The broadcaster's ring-buffer cache replays recent events to the
 	// new subscriber, which gives us a small natural overlap between
@@ -220,6 +229,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 	} else if ch != nil {
 		defer release()
 		go s.consumeWatchEvents(ctx, ch)
+		logger.Info("writepath: subscribed to write events broadcaster")
 	}
 
 	// Bootstrap fills nsToScan with everything that has activity past the
@@ -236,6 +246,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			logger.Info("writepath: scanner stopping", "reason", ctx.Err())
 			return ctx.Err()
 		case <-t.C:
 			s.runOnce(ctx)
@@ -270,6 +281,11 @@ func (s *Scanner) consumeWatchEvents(ctx context.Context, ch <-chan *resource.Wr
 				value:     ev.Value,
 				rv:        ev.ResourceVersion,
 			})
+			logger.Debug("writepath: watch event enqueued",
+				"namespace", ev.Key.Namespace,
+				"name", ev.Key.Name,
+				"action", ev.Type,
+				"rv", ev.ResourceVersion)
 		}
 	}
 }
@@ -289,9 +305,21 @@ func (s *Scanner) bootstrap(ctx context.Context) {
 	if effective <= 0 {
 		effective = 1
 	}
+	logger.Info("writepath: bootstrap starting", "since_rv", effective)
+	before := s.queueLen()
 	for _, b := range s.builders {
 		s.bootstrapBuilder(ctx, b, effective, logger)
 	}
+	logger.Info("writepath: bootstrap complete",
+		"since_rv", effective,
+		"events_enqueued", s.queueLen()-before)
+}
+
+// queueLen reports the current pending-event count (snapshot under lock).
+func (s *Scanner) queueLen() int {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	return len(s.queue)
 }
 
 func (s *Scanner) bootstrapBuilder(ctx context.Context, builder embed.Builder, sinceRv int64, logger log.Logger) {
@@ -318,6 +346,9 @@ func (s *Scanner) bootstrapBuilder(ctx context.Context, builder embed.Builder, s
 			"group", builder.Group(), "resource", builder.Resource(), "err", err)
 		return
 	}
+	logger.Info("writepath: bootstrap discovered namespaces",
+		"group", builder.Group(), "resource", builder.Resource(),
+		"namespaces", len(nss))
 	for _, ns := range nss {
 		if ctx.Err() != nil {
 			return
@@ -586,13 +617,20 @@ func (s *Scanner) processQueue(ctx context.Context) {
 		s.enqueue(ev)
 	}
 
-	if len(successes) > 0 || target > sinceRv || len(deferred) > 0 {
-		logger.Debug("writepath: cycle complete",
-			"drained", len(pending),
-			"succeeded", len(successes),
+	switch {
+	case len(successes) == 0 && len(failed) == 0 && len(deferred) == 0:
+		// No-op cycle (everything dropped at the cursor). Stay quiet.
+	case len(failed) == 0 && len(deferred) == 0:
+		logger.Info("writepath: cycle processed",
+			"events", len(successes),
+			"pooled_items", len(pooled),
+			"from", sinceRv, "to", target)
+	default:
+		logger.Info("writepath: cycle processed (partial)",
+			"events", len(successes),
+			"pooled_items", len(pooled),
 			"failed", len(failed),
 			"deferred", len(deferred),
-			"pooled_items", len(pooled),
 			"from", sinceRv, "to", target)
 	}
 }

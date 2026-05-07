@@ -25,13 +25,25 @@ func ProvideScanner(
 	emb *embedder.Embedder,
 	subscribe SubscribeFunc,
 ) (*Scanner, error) {
-	if cfg == nil || !cfg.VectorBackfillerEnabled {
+	logger := log.New("writepath")
+	switch {
+	case cfg == nil || !cfg.VectorBackfillerEnabled:
+		logger.Info("writepath: disabled (vector_backfiller not enabled)")
 		return nil, nil
-	}
-	if cfg.EmbeddingProvider == "" {
+	case cfg.EmbeddingProvider == "":
+		logger.Info("writepath: disabled (no embedding provider configured)")
 		return nil, nil
-	}
-	if storage == nil || vb == nil || emb == nil || subscribe == nil {
+	case storage == nil:
+		logger.Info("writepath: disabled (no storage backend)")
+		return nil, nil
+	case vb == nil:
+		logger.Info("writepath: disabled (no vector backend)")
+		return nil, nil
+	case emb == nil:
+		logger.Info("writepath: disabled (no embedder)")
+		return nil, nil
+	case subscribe == nil:
+		logger.Info("writepath: disabled (no write-event subscriber wired)")
 		return nil, nil
 	}
 	return New(Options{
@@ -40,6 +52,6 @@ func ProvideScanner(
 		Embedder:      emb,
 		Builders:      []embed.Builder{dashboard.New()},
 		Subscribe:     subscribe,
-		Log:           log.New("writepath"),
+		Log:           logger,
 	})
 }
