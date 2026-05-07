@@ -7,7 +7,8 @@ SELECT
     `action`,
     `value`
 FROM resource_history
-WHERE `group` = 'group'
+WHERE
+  `group` = 'group'
   AND `resource` = 'res'
   AND `resource_version` > 10000 
   AND `resource_version` <= 20000 
