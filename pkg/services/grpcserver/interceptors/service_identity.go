@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/grafana/authlib/types"
+	"github.com/grafana/grafana-app-sdk/logging"
 	"github.com/grafana/grafana/pkg/apimachinery/identity"
 	"google.golang.org/grpc"
 )
@@ -13,8 +14,11 @@ import (
 // Must be placed in the interceptor chain AFTER authentication so that auth info is available.
 func InnermostServiceIdentityUnaryServerInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if authInfo, ok := types.AuthInfoFrom(ctx); ok {
+		authInfo, ok := types.AuthInfoFrom(ctx)
+		logging.FromContext(ctx).Error("Extracting innermost service identity from auth info", "authInfoPresent", ok)
+		if ok {
 			if innermostSvcIdentity := authInfo.GetExtra()["innermostServiceIdentity"]; len(innermostSvcIdentity) > 0 {
+				logging.FromContext(ctx).Error("Found innermost service identity in auth info, adding to context", "innermostServiceIdentity", innermostSvcIdentity[0])
 				ctx = identity.WithInnermostServiceIdentity(ctx, innermostSvcIdentity[0])
 			}
 		}
