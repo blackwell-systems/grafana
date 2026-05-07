@@ -150,6 +150,17 @@ func TestUnifiedStorageQueries(t *testing.T) {
 					},
 				},
 			},
+			sqlResourceHistoryDistinctNamespaces: {
+				{
+					Name: "single path",
+					Data: &sqlResourceDistinctNamespacesRequest{
+						SQLTemplate: mocks.NewTestingSQLTemplate(),
+						Group:       "group",
+						Resource:    "res",
+						SinceRv:     10000,
+					},
+				},
+			},
 			sqlResourceHistoryGarbageGetCandidates: {
 				{
 					Name: "single path",

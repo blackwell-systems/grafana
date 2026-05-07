@@ -17,12 +17,33 @@ import (
 // ListModifiedSince returns the configured changes (filtered by sinceRv)
 // and a latestRv equal to the highest RV in the slice.
 type fakeStorage struct {
-	mu       sync.Mutex
-	changes  []*resource.ModifiedResource
-	listErr  error
-	statsErr error
-	itemErr  error // returned from the iterator partway through
-	itemErrI int   // index after which to inject itemErr
+	mu        sync.Mutex
+	changes   []*resource.ModifiedResource
+	listErr   error
+	statsErr  error
+	watchErr  error
+	watchCh   chan *resource.WrittenEvent
+	itemErr   error // returned from the iterator partway through
+	itemErrI  int   // index after which to inject itemErr
+
+	// Optional NamespaceLister capability. When namespaceListerNamespaces
+	// is non-nil, fakeStorage exposes ListNamespacesModifiedSince and
+	// returns these values; otherwise the scanner falls back to
+	// GetResourceStats. nsListerErr makes the capability error.
+	namespaceListerNamespaces []string
+	nsListerErr               error
+}
+
+// emit synchronously delivers a watch event on the channel set up by
+// startWatch. Tests use it to drive the watch path.
+func (f *fakeStorage) emit(ev *resource.WrittenEvent) {
+	f.mu.Lock()
+	ch := f.watchCh
+	f.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	ch <- ev
 }
 
 func (f *fakeStorage) WriteEvent(context.Context, resource.WriteEvent) (int64, error) {
@@ -37,8 +58,52 @@ func (f *fakeStorage) ListIterator(context.Context, *resourcepb.ListRequest, fun
 func (f *fakeStorage) ListHistory(context.Context, *resourcepb.ListRequest, func(resource.ListIterator) error) (int64, error) {
 	panic("not implemented")
 }
-func (f *fakeStorage) WatchWriteEvents(context.Context) (<-chan *resource.WrittenEvent, error) {
-	panic("not implemented")
+// WatchWriteEvents returns a channel the test can push events onto via
+// emit(). Closing happens when the parent ctx ends (handled by the test
+// harness). Tests that need watch errors set watchErr.
+func (f *fakeStorage) WatchWriteEvents(ctx context.Context) (<-chan *resource.WrittenEvent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.watchErr != nil {
+		return nil, f.watchErr
+	}
+	if f.watchCh == nil {
+		f.watchCh = make(chan *resource.WrittenEvent, 16)
+	}
+	return f.watchCh, nil
+}
+
+// ListNamespacesModifiedSince advertises the optional NamespaceLister
+// capability. By default it derives the set from `changes` (mirroring
+// what a real backend would return). Tests can:
+//   - leave defaults: capability returns derived namespaces;
+//   - set namespaceListerNamespaces: override the returned set;
+//   - set nsListerErr: force capability failure so the scanner falls
+//     back to GetResourceStats.
+func (f *fakeStorage) ListNamespacesModifiedSince(_ context.Context, group, res string, sinceRv int64) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.nsListerErr != nil {
+		return nil, f.nsListerErr
+	}
+	if f.namespaceListerNamespaces != nil {
+		return append([]string(nil), f.namespaceListerNamespaces...), nil
+	}
+	seen := map[string]struct{}{}
+	for _, c := range f.changes {
+		if c.Key.Group != group || c.Key.Resource != res {
+			continue
+		}
+		if c.ResourceVersion <= sinceRv {
+			continue
+		}
+		seen[c.Key.Namespace] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for ns := range seen {
+		out = append(out, ns)
+	}
+	return out, nil
 }
 // GetResourceStats returns one ResourceStats per distinct
 // (namespace, group, resource) seen in `changes`. The scanner uses this

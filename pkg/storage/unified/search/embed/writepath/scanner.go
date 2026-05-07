@@ -1,18 +1,27 @@
 // Package writepath keeps the vector index in sync with ongoing dashboard
-// writes. A periodic scanner enumerates active namespaces via
-// GetResourceStats, reads StorageBackend.ListModifiedSince per namespace
-// since the vector_latest_rv checkpoint, and aggregates every panel that
-// needs embedding into a single pooled EmbedText call followed by a
-// single Upsert. Provider-side chunking (e.g. Vertex's 250-text limit)
-// happens inside EmbedText, so the scanner doesn't need to know about it.
+// writes. The scanner combines two signals:
 //
-// The per-namespace fan-out is intentional: ListModifiedSince's existing
-// contract requires a non-empty namespace, so the scanner does the
-// fan-out itself rather than push cross-namespace semantics into the
-// storage backend. With a 30s cycle and a few-thousand namespaces ceiling
-// at Grafana scale, the extra round-trips per cycle are cheap. If that
-// stops being true, swap to a single cross-namespace ListModifiedSince
-// (see commit history for an earlier draft).
+//  1. WatchWriteEvents — a long-lived subscription that streams every
+//     dashboard write across the cluster. Each event adds the affected
+//     namespace to a "needs scan" set; the watch is purely a hint, never
+//     the source of truth for the embedded value.
+//
+//  2. ListModifiedSince per namespace — the cycle, every PollInterval,
+//     drains the set, calls ListModifiedSince(ns, vector_latest_rv) for
+//     each, dedups events whose RV ≤ checkpoint, and upserts the rest.
+//     The cursor is the only dedup mechanism: replayed watch events for
+//     already-processed RVs are filtered by the SQL query for free.
+//
+// At startup the scanner bootstraps the set so anything that committed
+// while the process was down (and isn't replayed by the watch) still
+// gets picked up. Discovery prefers the cheap NamespaceLister capability
+// (SQL backend), falling back to GetResourceStats for backends that
+// don't implement it.
+//
+// All embedding work for a cycle is pooled: one EmbedText call covers
+// every panel from every flagged namespace, then one Upsert writes them
+// in a single transaction. Provider-side chunking (e.g. Vertex's 250-text
+// limit) lives inside EmbedText.
 //
 // The scanner is the sole writer of vector_latest_rv. The backfiller has
 // its own state (vector_backfill_jobs) and may run concurrently; both
@@ -24,6 +33,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/grafana/grafana/pkg/infra/log"
@@ -37,6 +47,16 @@ import (
 // DefaultPollInterval is how long the scanner sleeps between cycles when
 // there is no work or the lock is held by another replica.
 const DefaultPollInterval = 30 * time.Second
+
+// NamespaceLister is an optional capability backends may implement to
+// answer "which namespaces have any change since RV X?" cheaply. Used
+// at scanner bootstrap so we don't have to walk every namespace via
+// GetResourceStats. Backends that don't implement it fall back to
+// GetResourceStats — the scanner still works, just less efficiently on
+// first start.
+type NamespaceLister interface {
+	ListNamespacesModifiedSince(ctx context.Context, group, resource string, sinceRv int64) ([]string, error)
+}
 
 type Options struct {
 	Storage       resource.StorageBackend
@@ -56,6 +76,12 @@ type Scanner struct {
 	builders      map[string]embed.Builder // keyed by resource
 	pollInterval  time.Duration
 	log           log.Logger
+
+	// nsToScan holds namespaces flagged by the watch loop or bootstrap.
+	// The cycle drains it, runs ListModifiedSince per namespace, and
+	// re-adds entries that didn't fully advance.
+	mu       sync.Mutex
+	nsToScan map[string]struct{}
 }
 
 func New(opts Options) (*Scanner, error) {
@@ -94,18 +120,65 @@ func New(opts Options) (*Scanner, error) {
 		builders:      builders,
 		pollInterval:  opts.PollInterval,
 		log:           opts.Log,
+		nsToScan:      make(map[string]struct{}),
 	}, nil
 }
 
-// Run loops until ctx is cancelled. Each iteration tries to acquire the
-// advisory lock; if held by another replica the cycle is skipped and we
-// sleep until the next tick.
+// flagNamespace marks a namespace for scanning. Empty strings are
+// dropped — they would mean a cluster-scoped event, which dashboards
+// don't produce.
+func (s *Scanner) flagNamespace(ns string) {
+	if ns == "" {
+		return
+	}
+	s.mu.Lock()
+	s.nsToScan[ns] = struct{}{}
+	s.mu.Unlock()
+}
+
+// drainNamespaces returns and clears the current set. Watch events that
+// arrive after this call go into the next cycle; failures during the
+// current cycle re-add specific namespaces via flagNamespace.
+func (s *Scanner) drainNamespaces() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.nsToScan) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(s.nsToScan))
+	for ns := range s.nsToScan {
+		out = append(out, ns)
+	}
+	s.nsToScan = make(map[string]struct{})
+	return out
+}
+
+// Run subscribes to write events, bootstraps the namespace set, then
+// runs the periodic drain-and-scan loop until ctx is cancelled.
 func (s *Scanner) Run(ctx context.Context) error {
+	logger := s.log.FromContext(ctx)
+
+	// Subscribe early so events flagged during bootstrap aren't lost.
+	ch, err := s.storage.WatchWriteEvents(ctx)
+	if err != nil {
+		logger.Error("writepath: subscribe to write events", "err", err)
+		// Watch failure isn't fatal; the periodic poll alone still works
+		// (with the bootstrap path repeating each cycle, which is wasteful
+		// but correct). Carry on without the watch.
+	} else {
+		go s.consumeWatchEvents(ctx, ch)
+	}
+
+	// Bootstrap fills nsToScan with everything that has activity past the
+	// checkpoint, covering writes that committed during downtime / before
+	// the watch became active.
+	s.bootstrap(ctx)
+
 	t := time.NewTicker(s.pollInterval)
 	defer t.Stop()
 
-	// Run one cycle immediately so a freshly-started replica picks up
-	// pending work without waiting for the first tick.
+	// First cycle runs immediately so a freshly-started replica picks up
+	// bootstrap work without waiting for the tick.
 	s.runOnce(ctx)
 	for {
 		select {
@@ -114,6 +187,74 @@ func (s *Scanner) Run(ctx context.Context) error {
 		case <-t.C:
 			s.runOnce(ctx)
 		}
+	}
+}
+
+// consumeWatchEvents flags namespaces of dashboard writes for the next
+// cycle. Events for unsupported groups/resources are ignored; events
+// whose RV is already past vector_latest_rv get filtered cheaply by
+// ListModifiedSince when the cycle runs, so we don't dedup here.
+func (s *Scanner) consumeWatchEvents(ctx context.Context, ch <-chan *resource.WrittenEvent) {
+	logger := s.log.FromContext(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				logger.Warn("writepath: watch channel closed")
+				return
+			}
+			if ev == nil || ev.Key == nil {
+				continue
+			}
+			if _, ok := s.builders[ev.Key.Resource]; !ok {
+				continue
+			}
+			s.flagNamespace(ev.Key.Namespace)
+		}
+	}
+}
+
+// bootstrap discovers namespaces with activity past the current
+// checkpoint and flags them. Prefers the cheap NamespaceLister
+// capability; falls back to GetResourceStats.
+func (s *Scanner) bootstrap(ctx context.Context) {
+	logger := s.log.FromContext(ctx)
+	sinceRv, err := s.vectorBackend.GetLatestRV(ctx)
+	if err != nil {
+		logger.Error("writepath: bootstrap read checkpoint", "err", err)
+		return
+	}
+	for _, b := range s.builders {
+		s.bootstrapBuilder(ctx, b, sinceRv, logger)
+	}
+}
+
+func (s *Scanner) bootstrapBuilder(ctx context.Context, builder embed.Builder, sinceRv int64, logger log.Logger) {
+	if nl, ok := s.storage.(NamespaceLister); ok {
+		nss, err := nl.ListNamespacesModifiedSince(ctx, builder.Group(), builder.Resource(), sinceRv)
+		if err == nil {
+			for _, ns := range nss {
+				s.flagNamespace(ns)
+			}
+			return
+		}
+		// Fall through to GetResourceStats on error so a misconfigured
+		// optimization path doesn't break boot.
+		logger.Warn("writepath: NamespaceLister failed, falling back to GetResourceStats",
+			"group", builder.Group(), "resource", builder.Resource(), "err", err)
+	}
+	stats, err := s.storage.GetResourceStats(ctx, resource.NamespacedResource{
+		Group:    builder.Group(),
+		Resource: builder.Resource(),
+	}, 0)
+	if err != nil {
+		logger.Error("writepath: bootstrap GetResourceStats", "err", err)
+		return
+	}
+	for _, st := range stats {
+		s.flagNamespace(st.Namespace)
 	}
 }
 
@@ -147,16 +288,28 @@ type pendingEmbed struct {
 	text  string
 }
 
-// scanBuilder enumerates active namespaces, pools every panel that
-// needs embedding into one call, and advances vector_latest_rv based on
-// the global outcome. Deletes execute inline because they don't need
-// the embedder.
+// scanBuilder drains the namespace set, fans out per-namespace
+// ListModifiedSince calls, pools every panel that needs embedding into
+// one call, and advances vector_latest_rv based on the global outcome.
+// Deletes execute inline because they don't need the embedder. On
+// failure (any namespace partially processed, or pooled embed/upsert
+// errored), namespaces with unfinished work are re-flagged so the next
+// cycle retries them.
 func (s *Scanner) scanBuilder(ctx context.Context, builder embed.Builder) {
 	logger := s.log.FromContext(ctx).New("group", builder.Group(), "resource", builder.Resource())
+
+	namespaces := s.drainNamespaces()
+	if len(namespaces) == 0 {
+		return
+	}
 
 	sinceRv, err := s.vectorBackend.GetLatestRV(ctx)
 	if err != nil {
 		logger.Error("writepath: read checkpoint", "err", err)
+		// Re-flag so a transient checkpoint read failure doesn't drop work.
+		for _, ns := range namespaces {
+			s.flagNamespace(ns)
+		}
 		return
 	}
 	// ListModifiedSince treats sinceRv == 0 as an error; bump to 1 so
@@ -164,16 +317,6 @@ func (s *Scanner) scanBuilder(ctx context.Context, builder embed.Builder) {
 	effectiveSince := sinceRv
 	if effectiveSince <= 0 {
 		effectiveSince = 1
-	}
-
-	stats, err := s.storage.GetResourceStats(ctx, resource.NamespacedResource{
-		Group:    builder.Group(),
-		Resource: builder.Resource(),
-		// Namespace empty = enumerate all.
-	}, 0)
-	if err != nil {
-		logger.Error("writepath: enumerate namespaces", "err", err)
-		return
 	}
 
 	// Aggregate across namespaces. vector_latest_rv is a single global
@@ -186,14 +329,15 @@ func (s *Scanner) scanBuilder(ctx context.Context, builder embed.Builder) {
 		maxLatestRv    int64
 		processed      int // counts inline-processed work (deletes); pooled embeds counted later
 	)
-	for _, st := range stats {
+	for _, ns := range namespaces {
 		if ctx.Err() != nil {
+			// Re-flag remaining work so we resume next cycle.
+			for _, ns := range namespaces {
+				s.flagNamespace(ns)
+			}
 			return
 		}
-		if st.Namespace == "" {
-			continue
-		}
-		nsLatest, nsProcessed, nsLowestFailed := s.collectNamespace(ctx, builder, st.Namespace, effectiveSince, &pending, logger)
+		nsLatest, nsProcessed, nsLowestFailed := s.collectNamespace(ctx, builder, ns, effectiveSince, &pending, logger)
 		if nsLatest > maxLatestRv {
 			maxLatestRv = nsLatest
 		}
@@ -203,8 +347,10 @@ func (s *Scanner) scanBuilder(ctx context.Context, builder embed.Builder) {
 		processed += nsProcessed
 	}
 
+	pooledFailed := false
 	if len(pending) > 0 {
 		if err := s.embedAndUpsertPooled(ctx, pending); err != nil {
+			pooledFailed = true
 			logger.Error("writepath: pooled embed/upsert",
 				"items", len(pending), "err", err)
 			// Treat the whole batch as failed: pin lowestFailedRv to the
@@ -223,12 +369,26 @@ func (s *Scanner) scanBuilder(ctx context.Context, builder embed.Builder) {
 	if target > sinceRv {
 		if err := s.vectorBackend.SetLatestRV(ctx, target); err != nil {
 			logger.Error("writepath: advance checkpoint", "err", err, "target", target)
+			// Couldn't persist the cursor; re-flag so we don't lose work.
+			for _, ns := range namespaces {
+				s.flagNamespace(ns)
+			}
 			return
 		}
 	}
+
+	// Re-flag namespaces that didn't fully advance. With pooled all-or-
+	// nothing semantics, that means "everything we processed" on any
+	// failure, since we can't tell which namespace owned the failing item.
+	if pooledFailed || lowestFailedRv != math.MaxInt64 {
+		for _, ns := range namespaces {
+			s.flagNamespace(ns)
+		}
+	}
+
 	if processed > 0 || target > sinceRv {
 		logger.Debug("writepath: cycle complete",
-			"namespaces", len(stats),
+			"namespaces", len(namespaces),
 			"processed", processed,
 			"pooled_items", len(pending),
 			"from", sinceRv, "to", target)

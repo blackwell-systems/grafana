@@ -38,6 +38,7 @@ var (
 	sqlResourceList                        = mustTemplate("resource_list.sql")
 	sqlResourceHistoryList                 = mustTemplate("resource_history_list.sql")
 	sqlResourceHistoryListModifiedSince    = mustTemplate("resource_history_list_since_modified.sql")
+	sqlResourceHistoryDistinctNamespaces   = mustTemplate("resource_history_distinct_namespaces.sql")
 	sqlResourceHistoryRead                 = mustTemplate("resource_history_read.sql")
 	sqlResourceHistoryReadLatestRV         = mustTemplate("resource_history_read_latest_rv.sql")
 	sqlResourceHistoryInsert               = mustTemplate("resource_history_insert.sql")
@@ -478,6 +479,30 @@ func (r sqlResourceListModifiedSinceRequest) Validate() error {
 	}
 	if r.LatestRv < r.SinceRv {
 		return fmt.Errorf("latest resource version must be greater or equal to since resource version")
+	}
+	return nil
+}
+
+// sqlResourceDistinctNamespacesRequest backs ListNamespacesModifiedSince.
+// The scanner uses it as a cheap discovery query: "which namespaces have
+// any resource_history rows past `SinceRv`?" — much cheaper than
+// GetResourceStats, which scans the live `resource` table per namespace.
+type sqlResourceDistinctNamespacesRequest struct {
+	sqltemplate.SQLTemplate
+	Group    string
+	Resource string
+	SinceRv  int64 // exclusive
+}
+
+func (r sqlResourceDistinctNamespacesRequest) Validate() error {
+	if r.Group == "" {
+		return fmt.Errorf("missing group")
+	}
+	if r.Resource == "" {
+		return fmt.Errorf("missing resource")
+	}
+	if r.SinceRv < 0 {
+		return fmt.Errorf("since resource version must be greater than or equal to zero")
 	}
 	return nil
 }

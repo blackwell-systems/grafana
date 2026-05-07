@@ -44,7 +44,17 @@ func multiPanelDashboard(uid, title string, n int) []byte {
 	return body
 }
 
+// newScanner builds a Scanner and runs bootstrap synchronously, so
+// runOnce() picks up everything the test pre-loaded into st.changes.
+// Tests that want to observe pre-bootstrap state should use newScannerNoBootstrap.
 func newScanner(t *testing.T, st *fakeStorage, vec *fakeVector) (*Scanner, *fakeText) {
+	t.Helper()
+	s, text := newScannerNoBootstrap(t, st, vec)
+	s.bootstrap(context.Background())
+	return s, text
+}
+
+func newScannerNoBootstrap(t *testing.T, st *fakeStorage, vec *fakeVector) (*Scanner, *fakeText) {
 	t.Helper()
 	text := &fakeText{dim: 4}
 	s, err := New(Options{
@@ -279,6 +289,8 @@ func TestScanner_MonotonicCheckpoint(t *testing.T) {
 	require.Equal(t, 1, text.calls)
 
 	st.changes = append(st.changes, dashChange(resourcepb.WatchEvent_MODIFIED, "ns", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")))
+	// Simulate a watch event for the new write, which flags ns for the next cycle.
+	s.flagNamespace("ns")
 	s.runOnce(context.Background())
 
 	require.Len(t, vec.upserts, 2, "second cycle adds one more pooled upsert")
@@ -344,6 +356,133 @@ func TestScanner_NoNamespacesActive_NoOp(t *testing.T) {
 	assert.Empty(t, vec.deletes)
 	assert.Equal(t, 0, text.calls)
 	assert.Equal(t, int64(0), vec.latestRV)
+}
+
+func TestScanner_Bootstrap_PrefersNamespaceListerCapability(t *testing.T) {
+	// fakeStorage advertises the NamespaceLister capability by default.
+	// Bootstrap should hit it instead of GetResourceStats.
+	st := &fakeStorage{}
+	st.changes = []*resource.ModifiedResource{
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-b", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")),
+	}
+	// A non-nil override forces this exact set, proving the scanner used
+	// the capability rather than deriving from changes via GetResourceStats.
+	st.namespaceListerNamespaces = []string{"ns-a", "ns-b"}
+
+	vec := newFakeVector()
+	s, _ := newScanner(t, st, vec) // bootstraps inline
+	s.runOnce(context.Background())
+
+	require.Len(t, vec.upserts, 1)
+	assert.Len(t, vec.upserts[0], 2)
+	assert.Equal(t, int64(200), vec.latestRV)
+}
+
+func TestScanner_Bootstrap_FallsBackOnCapabilityError(t *testing.T) {
+	// NamespaceLister errors → scanner falls back to GetResourceStats,
+	// which derives namespaces from `changes` in the fake.
+	st := &fakeStorage{}
+	st.changes = []*resource.ModifiedResource{
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
+	}
+	st.nsListerErr = errBoom
+	vec := newFakeVector()
+	s, _ := newScanner(t, st, vec)
+	s.runOnce(context.Background())
+
+	require.Len(t, vec.upserts, 1)
+	assert.Equal(t, int64(100), vec.latestRV)
+}
+
+func TestScanner_WatchEvent_FlagsNamespaceAndScansNextCycle(t *testing.T) {
+	// Storage starts empty → bootstrap finds nothing → cycle 1 is a no-op.
+	// A watch event arrives announcing activity in ns-x; cycle 2 picks it up.
+	st := &fakeStorage{}
+	vec := newFakeVector()
+	s, text := newScannerNoBootstrap(t, st, vec)
+	s.bootstrap(context.Background())
+
+	s.runOnce(context.Background())
+	require.Empty(t, vec.upserts)
+	require.Equal(t, 0, text.calls, "no work to do on cycle 1")
+
+	// Now activity happens. The change is added to storage AND a watch
+	// event flags the namespace.
+	st.mu.Lock()
+	st.changes = []*resource.ModifiedResource{
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-x", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
+	}
+	st.mu.Unlock()
+	s.flagNamespace("ns-x")
+
+	s.runOnce(context.Background())
+	require.Len(t, vec.upserts, 1, "cycle 2 finds the watch-flagged namespace")
+	assert.Equal(t, 1, text.calls)
+	assert.Equal(t, int64(100), vec.latestRV)
+}
+
+func TestScanner_WatchConsumer_IgnoresUnrelatedResources(t *testing.T) {
+	// The consumer goroutine should drop events whose resource isn't
+	// configured (e.g. folders, when only the dashboards builder is registered).
+	st := &fakeStorage{}
+	vec := newFakeVector()
+	s, _ := newScannerNoBootstrap(t, st, vec)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := st.WatchWriteEvents(ctx)
+	require.NoError(t, err)
+	go s.consumeWatchEvents(ctx, ch)
+
+	// Push two events: one for folders (ignored), one for dashboards (flagged).
+	st.emit(&resource.WrittenEvent{
+		Type: resourcepb.WatchEvent_ADDED,
+		Key: &resourcepb.ResourceKey{
+			Group: "folder.grafana.app", Resource: "folders", Namespace: "ns-x", Name: "f1",
+		},
+		ResourceVersion: 50,
+	})
+	st.emit(&resource.WrittenEvent{
+		Type: resourcepb.WatchEvent_ADDED,
+		Key: &resourcepb.ResourceKey{
+			Group: dashGroup, Resource: dashRes, Namespace: "ns-y", Name: "d1",
+		},
+		ResourceVersion: 60,
+	})
+	// Tiny synchronous wait by polling the set instead of sleeping.
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		_, ok := s.nsToScan["ns-y"]
+		_, dropped := s.nsToScan["ns-x"]
+		return ok && !dropped
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestScanner_PooledFailure_ReFlagsNamespaces(t *testing.T) {
+	// On a pooled failure, the scanner must re-flag the drained
+	// namespaces so the next cycle retries them.
+	st := &fakeStorage{}
+	st.changes = []*resource.ModifiedResource{
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-b", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")),
+	}
+	vec := newFakeVector()
+	vec.upsertErr = errBoom
+	s, _ := newScanner(t, st, vec)
+	s.runOnce(context.Background())
+
+	assert.Empty(t, vec.upserts)
+	assert.Equal(t, int64(99), vec.latestRV, "pooled failure pins target to lowest RV - 1")
+
+	// Both namespaces should be back in the set, awaiting retry.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, hasA := s.nsToScan["ns-a"]
+	_, hasB := s.nsToScan["ns-b"]
+	assert.True(t, hasA, "ns-a re-flagged after pooled failure")
+	assert.True(t, hasB, "ns-b re-flagged after pooled failure")
 }
 
 func TestChooseTarget(t *testing.T) {
