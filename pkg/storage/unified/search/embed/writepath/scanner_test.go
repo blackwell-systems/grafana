@@ -20,6 +20,8 @@ const dashGroup = "dashboard.grafana.app"
 const dashRes = "dashboards"
 const testModel = "test-model"
 
+// minimalDashboard returns a single-panel dashboard payload that the
+// dashboard extractor will turn into one embed.Item.
 func minimalDashboard(uid, title string) []byte {
 	body, _ := json.Marshal(map[string]any{
 		"uid":   uid,
@@ -31,18 +33,29 @@ func minimalDashboard(uid, title string) []byte {
 	return body
 }
 
-func newScanner(t *testing.T, st *fakeStorage, vec *fakeVector) *Scanner {
+// multiPanelDashboard returns a dashboard with N panels — used to verify
+// pooling collapses a fan of items into a single embed call.
+func multiPanelDashboard(uid, title string, n int) []byte {
+	panels := make([]any, n)
+	for i := 0; i < n; i++ {
+		panels[i] = map[string]any{"id": i + 1, "title": uid, "description": "panel"}
+	}
+	body, _ := json.Marshal(map[string]any{"uid": uid, "title": title, "panels": panels})
+	return body
+}
+
+func newScanner(t *testing.T, st *fakeStorage, vec *fakeVector) (*Scanner, *fakeText) {
 	t.Helper()
+	text := &fakeText{dim: 4}
 	s, err := New(Options{
 		Storage:       st,
 		VectorBackend: vec,
-		BatchEmbedder: newFakeBatchEmbedder(),
+		Embedder:      newFakeEmbedder(text),
 		Builders:      []embed.Builder{dashboard.New()},
-		Model:         testModel,
 		PollInterval:  time.Hour,
 	})
 	require.NoError(t, err)
-	return s
+	return s, text
 }
 
 func dashChange(action resourcepb.WatchEvent_Type, ns, name string, rv int64, value []byte) *resource.ModifiedResource {
@@ -63,18 +76,21 @@ func TestScanner_NewValidatesInputs(t *testing.T) {
 	}{
 		{"missing storage", func(o *Options) { o.Storage = nil }},
 		{"missing vector", func(o *Options) { o.VectorBackend = nil }},
-		{"missing batch embedder", func(o *Options) { o.BatchEmbedder = nil }},
+		{"missing embedder", func(o *Options) { o.Embedder = nil }},
 		{"missing builders", func(o *Options) { o.Builders = nil }},
-		{"missing model", func(o *Options) { o.Model = "" }},
+		{"missing embedder model", func(o *Options) {
+			e := *o.Embedder
+			e.Model = ""
+			o.Embedder = &e
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := Options{
 				Storage:       &fakeStorage{},
 				VectorBackend: newFakeVector(),
-				BatchEmbedder: newFakeBatchEmbedder(),
+				Embedder:      newFakeEmbedder(&fakeText{dim: 4}),
 				Builders:      []embed.Builder{dashboard.New()},
-				Model:         testModel,
 			}
 			tc.mod(&opts)
 			_, err := New(opts)
@@ -86,46 +102,72 @@ func TestScanner_NewValidatesInputs(t *testing.T) {
 func TestScanner_NoChanges_AdvancesToLatestRV(t *testing.T) {
 	st := &fakeStorage{}
 	vec := newFakeVector()
-	s := newScanner(t, st, vec)
+	s, text := newScanner(t, st, vec)
 
 	s.runOnce(context.Background())
 
-	// Empty change set + latestRv == 0 means no-op; checkpoint stays at 0.
+	// Empty change set: no embed call, no upsert, checkpoint stays at 0.
 	assert.Equal(t, int64(0), vec.latestRV)
 	assert.Empty(t, vec.upserts)
 	assert.Empty(t, vec.deletes)
+	assert.Equal(t, 0, text.calls, "no embed call on an empty cycle")
 }
 
-func TestScanner_HappyPath_UpsertsAndAdvances(t *testing.T) {
+func TestScanner_HappyPath_PoolsEmbedAndUpsertAcrossNamespaces(t *testing.T) {
 	st := &fakeStorage{}
 	st.changes = []*resource.ModifiedResource{
 		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
 		dashChange(resourcepb.WatchEvent_MODIFIED, "ns-b", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")),
 	}
 	vec := newFakeVector()
-	s := newScanner(t, st, vec)
+	s, text := newScanner(t, st, vec)
 
 	s.runOnce(context.Background())
 
-	require.Len(t, vec.upserts, 2)
-	assert.Equal(t, int64(200), vec.latestRV, "advances to latestRv on success")
+	// One pooled EmbedText call covers items from both namespaces.
+	assert.Equal(t, 1, text.calls, "pooled embed call across all namespaces")
+	require.Len(t, vec.upserts, 1, "single Upsert wraps every pooled vector")
+	assert.Len(t, vec.upserts[0], 2, "two dashboards = two vectors in the pooled upsert")
+	assert.Equal(t, int64(200), vec.latestRV)
 	assert.Equal(t, 1, vec.lockAttempts)
 	assert.Equal(t, 1, vec.lockReleases)
 }
 
-func TestScanner_DeleteEvent_CallsVectorDelete(t *testing.T) {
+func TestScanner_HappyPath_PoolsManyPanelsIntoOneEmbedCall(t *testing.T) {
+	// One dashboard with many panels + one dashboard with one panel.
+	// Pooling must produce a single EmbedText call regardless of how the
+	// panels are distributed across dashboards.
+	st := &fakeStorage{}
+	st.changes = []*resource.ModifiedResource{
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "big", 100, multiPanelDashboard("big", "Big Dash", 12)),
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-b", "small", 200, minimalDashboard("small", "Small Dash")),
+	}
+	vec := newFakeVector()
+	s, text := newScanner(t, st, vec)
+
+	s.runOnce(context.Background())
+
+	assert.Equal(t, 1, text.calls)
+	require.Len(t, vec.upserts, 1)
+	assert.Len(t, vec.upserts[0], 13, "12 panels + 1 panel = 13 pooled vectors")
+}
+
+func TestScanner_DeleteEvent_CallsVectorDeleteInline(t *testing.T) {
+	// Deletes don't need embeddings, so they execute inline in the
+	// per-namespace loop — not in the pooled phase.
 	st := &fakeStorage{}
 	st.changes = []*resource.ModifiedResource{
 		dashChange(resourcepb.WatchEvent_DELETED, "ns", "dash-x", 50, nil),
 	}
 	vec := newFakeVector()
-	s := newScanner(t, st, vec)
+	s, text := newScanner(t, st, vec)
 
 	s.runOnce(context.Background())
 
 	require.Len(t, vec.deletes, 1)
 	assert.Equal(t, deleteCall{Namespace: "ns", Model: testModel, Resource: dashRes, UID: "dash-x"}, vec.deletes[0])
 	assert.Equal(t, int64(50), vec.latestRV)
+	assert.Equal(t, 0, text.calls, "delete-only cycle does not call the embedder")
 }
 
 func TestScanner_LockUnavailable_NoWork(t *testing.T) {
@@ -135,41 +177,51 @@ func TestScanner_LockUnavailable_NoWork(t *testing.T) {
 	}
 	vec := newFakeVector()
 	vec.lockUnavailable = true
-	s := newScanner(t, st, vec)
+	s, text := newScanner(t, st, vec)
 
 	s.runOnce(context.Background())
 
 	assert.Empty(t, vec.upserts)
 	assert.Equal(t, int64(0), vec.latestRV)
 	assert.Equal(t, 1, vec.lockAttempts)
-	assert.Equal(t, 0, vec.lockReleases, "lock should not be released since it wasn't acquired")
+	assert.Equal(t, 0, vec.lockReleases)
+	assert.Equal(t, 0, text.calls)
 }
 
-func TestScanner_PartialFailure_AdvancesToLowestFailureMinusOne(t *testing.T) {
-	// Three dashboards: two succeed, one fails. The checkpoint should
-	// stop short of the failure so it gets retried.
+func TestScanner_PooledUpsertFailure_BlocksAdvanceAtLowestRV(t *testing.T) {
+	// Pooling makes the failure mode all-or-nothing: a single Upsert
+	// covers every dashboard's vectors, so any failure inside the
+	// upsert pins the global advance to (lowestRvInBatch - 1).
 	st := &fakeStorage{}
 	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "ok-a", 100, minimalDashboard("ok-a", "OK A")),
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "boom", 200, minimalDashboard("boom", "Boom")),
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "ok-b", 300, minimalDashboard("ok-b", "OK B")),
+		dashChange(resourcepb.WatchEvent_ADDED, "ns", "first", 100, minimalDashboard("first", "First")),
+		dashChange(resourcepb.WatchEvent_ADDED, "ns", "second", 200, minimalDashboard("second", "Second")),
+		dashChange(resourcepb.WatchEvent_ADDED, "ns", "third", 300, minimalDashboard("third", "Third")),
 	}
 	vec := newFakeVector()
-	// Per-call hook: fail upserts whose UID is "boom".
-	vec.upsertErrFn = func(vs []vector.Vector) error {
-		for _, v := range vs {
-			if v.UID == "boom" {
-				return errBoom
-			}
-		}
-		return nil
-	}
-	s := newScanner(t, st, vec)
+	vec.upsertErr = errBoom
+	s, _ := newScanner(t, st, vec)
 	s.runOnce(context.Background())
 
-	// Successful upserts only — boom dropped.
-	require.Len(t, vec.upserts, 2)
-	assert.Equal(t, int64(199), vec.latestRV, "should advance to (lowestFailedRv - 1)")
+	assert.Empty(t, vec.upserts, "Upsert failed; nothing was recorded")
+	assert.Equal(t, int64(99), vec.latestRV, "checkpoint pinned to lowest pending RV - 1")
+}
+
+func TestScanner_PooledEmbedFailure_BlocksAdvanceAtLowestRV(t *testing.T) {
+	// Same property as the upsert-failure test, but driven by an embedder error.
+	st := &fakeStorage{}
+	st.changes = []*resource.ModifiedResource{
+		dashChange(resourcepb.WatchEvent_ADDED, "ns", "alpha", 100, minimalDashboard("alpha", "Alpha")),
+		dashChange(resourcepb.WatchEvent_ADDED, "ns", "beta", 200, minimalDashboard("beta", "Beta")),
+	}
+	vec := newFakeVector()
+	s, text := newScanner(t, st, vec)
+	text.failNext = errBoom
+
+	s.runOnce(context.Background())
+
+	assert.Empty(t, vec.upserts)
+	assert.Equal(t, int64(99), vec.latestRV)
 }
 
 func TestScanner_IteratorError_DoesNotAdvance(t *testing.T) {
@@ -180,7 +232,7 @@ func TestScanner_IteratorError_DoesNotAdvance(t *testing.T) {
 	st.itemErr = errBoom
 	st.itemErrI = 0
 	vec := newFakeVector()
-	s := newScanner(t, st, vec)
+	s, _ := newScanner(t, st, vec)
 
 	s.runOnce(context.Background())
 
@@ -188,9 +240,10 @@ func TestScanner_IteratorError_DoesNotAdvance(t *testing.T) {
 }
 
 func TestScanner_StaleSubresources_AreDeletedBeforeUpsert(t *testing.T) {
-	// Pre-seed the vector store with two stored panels under the same UID,
-	// then drive an update that only contains panel/1. The scanner must
-	// delete panel/2 before upserting.
+	// Pre-seed two stored panels under one dashboard, then drive an
+	// update whose extract only contains panel/1. Cleanup runs inline
+	// during collection (per-dashboard), so it lands before the pooled
+	// upsert.
 	st := &fakeStorage{}
 	st.changes = []*resource.ModifiedResource{
 		dashChange(resourcepb.WatchEvent_MODIFIED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
@@ -202,7 +255,7 @@ func TestScanner_StaleSubresources_AreDeletedBeforeUpsert(t *testing.T) {
 		"panel/2": "stale panel that should be deleted",
 	}
 
-	s := newScanner(t, st, vec)
+	s, _ := newScanner(t, st, vec)
 	s.runOnce(context.Background())
 
 	require.Len(t, vec.delsubs, 1)
@@ -211,27 +264,30 @@ func TestScanner_StaleSubresources_AreDeletedBeforeUpsert(t *testing.T) {
 }
 
 func TestScanner_MonotonicCheckpoint(t *testing.T) {
-	// Run two cycles. After the first the checkpoint is at 100; second
-	// cycle should not reprocess the same resource and should advance to 200.
+	// Two cycles. Each cycle issues at most one pooled embed/upsert.
+	// After cycle 1 the checkpoint is at 100; cycle 2 must not
+	// reprocess RV 100 and should advance to 200.
 	vec := newFakeVector()
 	st := &fakeStorage{}
 	st.changes = []*resource.ModifiedResource{
 		dashChange(resourcepb.WatchEvent_ADDED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
 	}
-	s := newScanner(t, st, vec)
+	s, text := newScanner(t, st, vec)
 	s.runOnce(context.Background())
 	require.Len(t, vec.upserts, 1)
 	require.Equal(t, int64(100), vec.latestRV)
+	require.Equal(t, 1, text.calls)
 
 	st.changes = append(st.changes, dashChange(resourcepb.WatchEvent_MODIFIED, "ns", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")))
 	s.runOnce(context.Background())
 
-	// Upserts grew by exactly one — the previously-seen RV 100 was filtered.
-	require.Len(t, vec.upserts, 2)
+	require.Len(t, vec.upserts, 2, "second cycle adds one more pooled upsert")
+	assert.Len(t, vec.upserts[1], 1, "only the unseen RV 200 dashboard ended up in cycle 2's batch")
 	require.Equal(t, int64(200), vec.latestRV)
+	require.Equal(t, 2, text.calls, "one embed call per non-empty cycle")
 }
 
-func TestScanner_UnknownAction_TreatedAsFailure(t *testing.T) {
+func TestScanner_UnknownAction_BlocksAdvance(t *testing.T) {
 	st := &fakeStorage{}
 	st.changes = []*resource.ModifiedResource{
 		{
@@ -243,38 +299,19 @@ func TestScanner_UnknownAction_TreatedAsFailure(t *testing.T) {
 		},
 	}
 	vec := newFakeVector()
-	s := newScanner(t, st, vec)
+	s, text := newScanner(t, st, vec)
 	s.runOnce(context.Background())
 
 	assert.Empty(t, vec.upserts)
 	assert.Empty(t, vec.deletes)
-	// Unknown action is a per-item failure; checkpoint stops at (failed - 1)
-	// so the same item is retried next cycle (it'll fail again unless the
-	// payload changes, but operators can investigate via logs).
-	assert.Equal(t, int64(49), vec.latestRV)
+	assert.Equal(t, 0, text.calls)
+	assert.Equal(t, int64(49), vec.latestRV, "checkpoint stops at (failed - 1)")
 }
 
-func TestScanner_MultiNamespace_ProcessesEachAndAdvancesToMaxRV(t *testing.T) {
-	// Two namespaces, one resource each. Fan-out must produce two
-	// upserts and advance to the highest RV seen.
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash A")),
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-b", "dash-2", 200, minimalDashboard("dash-2", "Dash B")),
-	}
-	vec := newFakeVector()
-	s := newScanner(t, st, vec)
-
-	s.runOnce(context.Background())
-
-	require.Len(t, vec.upserts, 2)
-	assert.Equal(t, int64(200), vec.latestRV)
-}
-
-func TestScanner_MultiNamespace_FailureInOneNamespaceBlocksGlobalAdvance(t *testing.T) {
-	// Namespace A has a failing dashboard at RV 100. Namespace B is
-	// healthy with RV 200. Global checkpoint must stop at 99 so A's
-	// failure is retried, even though everything in B succeeded.
+func TestScanner_MultiNamespace_FailureBlocksGlobalAdvance(t *testing.T) {
+	// Pooling makes any per-cycle Upsert failure global. Even if only
+	// one namespace has a problem, the checkpoint stops at the lowest
+	// pending RV minus one.
 	st := &fakeStorage{}
 	st.changes = []*resource.ModifiedResource{
 		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "boom", 100, minimalDashboard("boom", "Boom")),
@@ -289,31 +326,30 @@ func TestScanner_MultiNamespace_FailureInOneNamespaceBlocksGlobalAdvance(t *test
 		}
 		return nil
 	}
-	s := newScanner(t, st, vec)
+	s, _ := newScanner(t, st, vec)
 	s.runOnce(context.Background())
 
-	require.Len(t, vec.upserts, 1, "ns-b succeeds; ns-a fails")
-	assert.Equal(t, int64(99), vec.latestRV, "global advance stops at lowest failure - 1")
+	assert.Empty(t, vec.upserts, "pooled upsert containing 'boom' fails wholesale")
+	assert.Equal(t, int64(99), vec.latestRV, "global advance stops at lowest pending RV - 1")
 }
 
 func TestScanner_NoNamespacesActive_NoOp(t *testing.T) {
-	// GetResourceStats returns empty (no dashboards anywhere yet); the
-	// scanner should run cleanly without making list calls.
 	st := &fakeStorage{}
 	vec := newFakeVector()
-	s := newScanner(t, st, vec)
+	s, text := newScanner(t, st, vec)
 
 	s.runOnce(context.Background())
 
 	assert.Empty(t, vec.upserts)
 	assert.Empty(t, vec.deletes)
+	assert.Equal(t, 0, text.calls)
 	assert.Equal(t, int64(0), vec.latestRV)
 }
 
 func TestChooseTarget(t *testing.T) {
 	const noFail = int64(1<<63 - 1)
 	cases := []struct {
-		name                                 string
+		name                                    string
 		sinceRv, latestRv, lowestFailedRv, want int64
 	}{
 		{"no failures advances to latest", 50, 200, noFail, 200},

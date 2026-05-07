@@ -32,9 +32,8 @@ func ProvideScanner(
 	return New(Options{
 		Storage:       storage,
 		VectorBackend: vb,
-		BatchEmbedder: embedder.NewBatchEmbedder(*emb),
+		Embedder:      emb,
 		Builders:      []embed.Builder{dashboard.New()},
-		Model:         emb.Model,
 		Log:           log.New("writepath"),
 	})
 }

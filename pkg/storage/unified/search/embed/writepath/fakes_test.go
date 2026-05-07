@@ -263,10 +263,27 @@ func (f *fakeVector) TryAcquireScannerLock(context.Context) (func(), bool, error
 	}, true, nil
 }
 
-// fakeText is a deterministic embedder used by the BatchEmbedder.
-type fakeText struct{ dim int }
+// fakeText is a deterministic embedder used by the scanner. It records
+// each EmbedText invocation so tests can assert on the *number* of
+// pooled calls — the whole point of the scan-cycle batching.
+type fakeText struct {
+	mu       sync.Mutex
+	dim      int
+	calls    int     // number of EmbedText invocations
+	textSets [][]int // counts of texts per call (per-call sizes)
+	failNext error   // if non-nil, returned from the next EmbedText call
+}
 
 func (f *fakeText) EmbedText(_ context.Context, in embedder.EmbedTextInput) (embedder.EmbedTextOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.textSets = append(f.textSets, []int{len(in.Texts)})
+	if f.failNext != nil {
+		err := f.failNext
+		f.failNext = nil
+		return embedder.EmbedTextOutput{}, err
+	}
 	out := embedder.EmbedTextOutput{Embeddings: make([]embedder.Embedding, len(in.Texts))}
 	for i := range in.Texts {
 		dense := make([]float32, f.dim)
@@ -278,15 +295,14 @@ func (f *fakeText) EmbedText(_ context.Context, in embedder.EmbedTextInput) (emb
 	return out, nil
 }
 
-func newFakeBatchEmbedder() *embedder.BatchEmbedder {
-	e := embedder.Embedder{
-		TextEmbedder: &fakeText{dim: 4},
+func newFakeEmbedder(text *fakeText) *embedder.Embedder {
+	return &embedder.Embedder{
+		TextEmbedder: text,
 		Model:        "test-model",
 		VectorType:   embedder.VectorTypeDense,
 		Metric:       embedder.CosineDistance,
-		Dimensions:   4,
+		Dimensions:   uint32(text.dim),
 	}
-	return embedder.NewBatchEmbedder(e)
 }
 
 var errBoom = errors.New("boom")
