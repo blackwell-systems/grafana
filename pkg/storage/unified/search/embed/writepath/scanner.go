@@ -295,6 +295,17 @@ func (s *Scanner) bootstrap(ctx context.Context) {
 }
 
 func (s *Scanner) bootstrapBuilder(ctx context.Context, builder embed.Builder, sinceRv int64, logger log.Logger) {
+	// If a backfill job is still working through this resource, let it
+	// finish; the CompleteBackfillJob hand-off advances vector_latest_rv
+	// to the job's StoppingRV and the scanner takes over from there.
+	// Bootstrapping now would re-enqueue everything backfill is currently
+	// embedding, racing against it for no benefit.
+	if s.backfillBlocking(ctx, builder, logger) {
+		logger.Info("writepath: skipping bootstrap; backfill in progress",
+			"group", builder.Group(), "resource", builder.Resource())
+		return
+	}
+
 	nl, ok := s.storage.(NamespaceLister)
 	if !ok {
 		logger.Warn("writepath: storage doesn't implement NamespaceLister; cannot recover missed writes",
@@ -313,6 +324,54 @@ func (s *Scanner) bootstrapBuilder(ctx context.Context, builder embed.Builder, s
 		}
 		s.bootstrapNamespace(ctx, builder, ns, sinceRv, logger)
 	}
+}
+
+// backfillBlocking reports whether an incomplete backfill job covers
+// the given builder. A job covers a resource when its (model, resource)
+// matches; an empty resource on the job means "all builders for this
+// model". Errors fail open — we'd rather risk redundant work than stall
+// the scanner if the lookup itself is broken.
+func (s *Scanner) backfillBlocking(ctx context.Context, builder embed.Builder, logger log.Logger) bool {
+	jobs, err := s.vectorBackend.ListIncompleteBackfillJobs(ctx)
+	if err != nil {
+		logger.Warn("writepath: list incomplete backfill jobs", "err", err)
+		return false
+	}
+	for _, j := range jobs {
+		if j.IsComplete || j.Model != s.embedder.Model {
+			continue
+		}
+		if j.Resource == "" || j.Resource == builder.Resource() {
+			return true
+		}
+	}
+	return false
+}
+
+// blockedResources returns the set of resource names currently covered
+// by an incomplete backfill job for our model. Used by processQueue to
+// skip events whose resource is mid-backfill (those events stay queued
+// for a later cycle).
+func (s *Scanner) blockedResources(ctx context.Context, logger log.Logger) map[string]struct{} {
+	jobs, err := s.vectorBackend.ListIncompleteBackfillJobs(ctx)
+	if err != nil {
+		logger.Warn("writepath: list incomplete backfill jobs", "err", err)
+		return nil
+	}
+	out := map[string]struct{}{}
+	for _, j := range jobs {
+		if j.IsComplete || j.Model != s.embedder.Model {
+			continue
+		}
+		if j.Resource == "" {
+			for r := range s.builders {
+				out[r] = struct{}{}
+			}
+			continue
+		}
+		out[j.Resource] = struct{}{}
+	}
+	return out
 }
 
 // bootstrapNamespace pulls every event past sinceRv for one namespace
@@ -393,18 +452,24 @@ func (s *Scanner) processQueue(ctx context.Context) {
 		return
 	}
 
+	// Resources currently mid-backfill: skip events for them this cycle.
+	// They'll be retried later, by which time the backfill should have
+	// completed and advanced vector_latest_rv past their range.
+	blocked := s.blockedResources(ctx, logger)
+
 	// Track per-event outcome so we know what to re-enqueue. The lowest
 	// failed RV pins the global advance below it, ensuring failed work
-	// is retried before the cursor moves past.
+	// is retried before the cursor moves past. `deferred` events are
+	// re-enqueued without touching lowestFailedRv — they're blocked by
+	// an external concern (e.g. backfill in progress), not failures.
 	var (
 		pooled         []pendingEmbed
-		pooledOwners   []*pendingEvent // 1:1 alignment is impossible (multi-panel), so we re-enqueue source events on pooled failure separately
 		failed         []*pendingEvent
+		deferred       []*pendingEvent
 		successes      []*pendingEvent
 		lowestFailedRv = int64(math.MaxInt64)
 		maxRv          = sinceRv
 	)
-	_ = pooledOwners // see comment below; we track owners as a slice of source events
 
 	// Source events that contributed to `pooled` so we can re-enqueue
 	// them on pooled failure.
@@ -419,6 +484,13 @@ func (s *Scanner) processQueue(ctx context.Context) {
 		// processed by a prior cycle (or is replayed history from the
 		// watch). Drop it without touching state.
 		if ev.rv <= sinceRv {
+			continue
+		}
+		// Backfill-gating: events for resources mid-backfill stay
+		// queued until the backfill completes. Don't pin
+		// lowestFailedRv — other resources can advance freely.
+		if _, blockedRes := blocked[ev.resource]; blockedRes {
+			deferred = append(deferred, ev)
 			continue
 		}
 		builder, ok := s.builders[ev.resource]
@@ -502,19 +574,24 @@ func (s *Scanner) processQueue(ctx context.Context) {
 		}
 	}
 
-	// Re-enqueue events that didn't make the cut. The cursor advance
-	// guarantees `target ≥ ev.rv` for every successful event, so
-	// re-queueing failures alone is sufficient — the cursor filter on
-	// the next cycle handles everything else.
+	// Re-enqueue events that didn't make the cut: failures (so they
+	// retry), and backfill-deferred events (so they're processed once
+	// the backfill clears). The cursor advance guarantees `target ≥
+	// ev.rv` for every successful event, so the cursor filter on the
+	// next cycle naturally drops anything redundant.
 	for _, ev := range failed {
 		s.enqueue(ev)
 	}
+	for _, ev := range deferred {
+		s.enqueue(ev)
+	}
 
-	if len(successes) > 0 || target > sinceRv {
+	if len(successes) > 0 || target > sinceRv || len(deferred) > 0 {
 		logger.Debug("writepath: cycle complete",
 			"drained", len(pending),
 			"succeeded", len(successes),
 			"failed", len(failed),
+			"deferred", len(deferred),
 			"pooled_items", len(pooled),
 			"from", sinceRv, "to", target)
 	}

@@ -572,6 +572,72 @@ func TestScanner_PooledFailure_ReEnqueuesSourceEvents(t *testing.T) {
 	assert.True(t, hasB, "dash-2 re-enqueued after pooled failure")
 }
 
+func TestScanner_BackfillInProgress_BootstrapSkipped(t *testing.T) {
+	// An incomplete backfill job for our resource means bootstrap should
+	// not list/enqueue anything. The backfill's CompleteBackfillJob
+	// hand-off will move vector_latest_rv forward when it's done.
+	st := &fakeStorage{}
+	st.changes = []*resource.ModifiedResource{
+		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
+	}
+	vec := newFakeVector()
+	vec.jobs = []vector.BackfillJob{{
+		ID: 1, Model: testModel, Resource: dashRes, StoppingRV: 1000,
+	}}
+	s, _ := newScanner(t, st, vec) // bootstraps inline
+	s.runOnce(context.Background())
+
+	assert.Empty(t, vec.upserts, "backfill in progress; nothing should be embedded")
+	assert.Equal(t, int64(0), vec.latestRV)
+}
+
+func TestScanner_BackfillInProgress_WatchEventsDeferred(t *testing.T) {
+	// Watch events arriving while backfill runs are queued but not
+	// processed. They drain on the next cycle after backfill completes.
+	st := &fakeStorage{}
+	vec := newFakeVector()
+	vec.jobs = []vector.BackfillJob{{
+		ID: 1, Model: testModel, Resource: dashRes, StoppingRV: 1000,
+	}}
+
+	s, text := newScannerNoBootstrap(t, st, vec)
+
+	// Live event arrives during backfill.
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns-x", "dash-x", 1500, minimalDashboard("dash-x", "Dash X")))
+	s.runOnce(context.Background())
+
+	assert.Empty(t, vec.upserts, "deferred while backfill is in flight")
+	assert.Equal(t, 0, text.calls)
+
+	// Backfill completes (test simulates handoff).
+	vec.jobs = nil
+	vec.latestRV = 1000
+
+	s.runOnce(context.Background())
+
+	require.Len(t, vec.upserts, 1, "deferred event drains once backfill clears")
+	assert.Equal(t, "dash-x", vec.upserts[0][0].UID)
+	assert.Equal(t, int64(1500), vec.latestRV)
+}
+
+func TestScanner_BackfillForDifferentResource_DoesNotBlock(t *testing.T) {
+	// A backfill job for a model/resource the scanner doesn't handle
+	// (different model in this case) must not gate dashboard work.
+	st := &fakeStorage{}
+	st.changes = []*resource.ModifiedResource{
+		dashChange(resourcepb.WatchEvent_ADDED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
+	}
+	vec := newFakeVector()
+	vec.jobs = []vector.BackfillJob{{
+		ID: 1, Model: "some-other-model", Resource: dashRes, StoppingRV: 1000,
+	}}
+	s, _ := newScanner(t, st, vec)
+	s.runOnce(context.Background())
+
+	require.Len(t, vec.upserts, 1, "different model = different vector space; not blocked")
+	assert.Equal(t, int64(100), vec.latestRV)
+}
+
 func TestChooseTarget(t *testing.T) {
 	const noFail = int64(1<<63 - 1)
 	cases := []struct {

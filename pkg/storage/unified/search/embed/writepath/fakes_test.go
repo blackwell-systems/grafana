@@ -216,6 +216,9 @@ type fakeVector struct {
 	lockUnavailable bool
 	lockAttempts    int
 	lockReleases    int
+
+	// Backfill state — drives ListIncompleteBackfillJobs.
+	jobs []vector.BackfillJob
 }
 
 type deleteCall struct{ Namespace, Model, Resource, UID string }
@@ -304,7 +307,11 @@ func (f *fakeVector) SetLatestRV(_ context.Context, rv int64) error {
 	return nil
 }
 func (f *fakeVector) ListIncompleteBackfillJobs(context.Context) ([]vector.BackfillJob, error) {
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]vector.BackfillJob, len(f.jobs))
+	copy(out, f.jobs)
+	return out, nil
 }
 func (f *fakeVector) UpdateBackfillJobCheckpoint(context.Context, int64, string, string) error {
 	return nil
