@@ -25,6 +25,11 @@ var _ VectorBackend = (*pgvectorBackend)(nil)
 // matching row.
 const backfillAdvisoryLockName = "vectorbackfiller"
 
+// scannerAdvisoryLockName is the per-cycle lock used by the write-path
+// scanner. Distinct from backfillAdvisoryLockName so a backfill and a
+// scanner cycle can run concurrently on the same cluster.
+const scannerAdvisoryLockName = "vectorwritescanner"
+
 type pgvectorBackend struct {
 	db       db.DB
 	dialect  sqltemplate.Dialect
@@ -92,14 +97,6 @@ func (b *pgvectorBackend) Upsert(ctx context.Context, vectors []Vector) error {
 		}
 	}
 
-	// track max rv so we can update global db rv
-	var batchMaxRV int64
-	for i := range vectors {
-		if vectors[i].ResourceVersion > batchMaxRV {
-			batchMaxRV = vectors[i].ResourceVersion
-		}
-	}
-
 	return b.db.WithTx(ctx, nil, func(ctx context.Context, tx db.Tx) error {
 		for i := range vectors {
 			if err := validateResource(vectors[i].Resource); err != nil {
@@ -117,16 +114,6 @@ func (b *pgvectorBackend) Upsert(ctx context.Context, vectors []Vector) error {
 			}
 			if _, err := dbutil.Exec(ctx, tx, sqlVectorCollectionUpsert, req); err != nil {
 				return fmt.Errorf("upsert vector %s/%s: %w", vectors[i].UID, vectors[i].Subresource, err)
-			}
-		}
-
-		// WHERE clause keeps this monotonic under concurrent writers.
-		if batchMaxRV > 0 {
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE vector_latest_rv SET latest_rv = $1 WHERE id = 1 AND latest_rv < $1`,
-				batchMaxRV,
-			); err != nil {
-				return fmt.Errorf("bump vector_latest_rv: %w", err)
 			}
 		}
 		return nil
@@ -369,4 +356,43 @@ func (b *pgvectorBackend) GetLatestRV(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("read vector_latest_rv: %w", err)
 	}
 	return rv, nil
+}
+
+// SetLatestRV bumps the checkpoint. The WHERE guard makes this monotonic;
+// a stale rv from a slower replica can't rewind a more advanced cursor.
+func (b *pgvectorBackend) SetLatestRV(ctx context.Context, rv int64) error {
+	if rv <= 0 {
+		return nil
+	}
+	if _, err := b.db.ExecContext(ctx,
+		`UPDATE vector_latest_rv SET latest_rv = $1 WHERE id = 1 AND latest_rv < $1`,
+		rv,
+	); err != nil {
+		return fmt.Errorf("set vector_latest_rv: %w", err)
+	}
+	return nil
+}
+
+func (b *pgvectorBackend) TryAcquireScannerLock(ctx context.Context) (func(), bool, error) {
+	conn, err := b.db.SqlDB().Conn(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("acquire scanner conn: %w", err)
+	}
+	var got bool
+	if err := conn.QueryRowContext(ctx,
+		"SELECT pg_try_advisory_lock(hashtext($1)::bigint)", scannerAdvisoryLockName,
+	).Scan(&got); err != nil {
+		_ = conn.Close()
+		return nil, false, fmt.Errorf("pg_try_advisory_lock: %w", err)
+	}
+	if !got {
+		_ = conn.Close()
+		return nil, false, nil
+	}
+	release := func() {
+		_, _ = conn.ExecContext(context.Background(),
+			"SELECT pg_advisory_unlock(hashtext($1)::bigint)", scannerAdvisoryLockName)
+		_ = conn.Close()
+	}
+	return release, true, nil
 }

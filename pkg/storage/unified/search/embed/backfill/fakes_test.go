@@ -191,6 +191,9 @@ type fakeVector struct {
 	lockUnavailable bool
 	lockAttempts    int
 	lockReleases    int
+
+	// Scanner hand-off:
+	latestRVSet int64
 }
 
 type checkpointCall struct {
@@ -269,6 +272,17 @@ func (f *fakeVector) Exists(_ context.Context, ns, model, res, uid string) (bool
 	return f.existsSet[existsKey(ns, model, res, uid)], nil
 }
 func (f *fakeVector) GetLatestRV(context.Context) (int64, error) { return 0, nil }
+func (f *fakeVector) SetLatestRV(_ context.Context, rv int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if rv > f.latestRVSet {
+		f.latestRVSet = rv
+	}
+	return nil
+}
+func (f *fakeVector) TryAcquireScannerLock(context.Context) (func(), bool, error) {
+	return func() {}, true, nil
+}
 func (f *fakeVector) ListIncompleteBackfillJobs(context.Context) ([]vector.BackfillJob, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

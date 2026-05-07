@@ -118,6 +118,10 @@ func TestRunBackfillJob_HappyPath_EmbedsAndCompletes(t *testing.T) {
 	for _, c := range vec.checkpoints {
 		assert.Empty(t, c.LastError, "happy path leaves last_error empty")
 	}
+
+	// Scanner hand-off: completing a job bumps vector_latest_rv to
+	// StoppingRV so the write-path scanner doesn't re-walk the same range.
+	assert.Equal(t, int64(100), vec.latestRVSet)
 }
 
 func TestRunBackfillJob_SkipsExistingEmbeddings(t *testing.T) {

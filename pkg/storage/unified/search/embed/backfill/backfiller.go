@@ -118,6 +118,13 @@ func (b *VectorBackfiller) runBackfill(ctx context.Context) {
 		} else {
 			log.Info("backfill: job complete", "job_id", job.ID, "model", job.Model)
 		}
+		// Hand off the scanner: anything <= StoppingRV is now durable
+		// in the index, so the write-path scanner can start from there.
+		// SetLatestRV is monotonic — if the scanner is already further
+		// ahead this is a no-op.
+		if err := b.vectorBackend.SetLatestRV(ctx, job.StoppingRV); err != nil {
+			log.Warn("backfill: bump scanner checkpoint", "job_id", job.ID, "err", err)
+		}
 	}
 }
 

@@ -33,6 +33,7 @@ import (
 	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
 	"github.com/grafana/grafana/pkg/storage/unified/search"
 	"github.com/grafana/grafana/pkg/storage/unified/search/embed/backfill"
+	"github.com/grafana/grafana/pkg/storage/unified/search/embed/writepath"
 	"github.com/grafana/grafana/pkg/storage/unified/search/embed/embedder"
 	"github.com/grafana/grafana/pkg/storage/unified/search/vector"
 	"github.com/grafana/grafana/pkg/util/scheduler"
@@ -188,6 +189,15 @@ func ProvideUnifiedStorageGrpcService(cfg *setting.Cfg,
 	if bf != nil {
 		s.subservices = append(s.subservices,
 			services.NewBasicService(nil, bf.Run, nil).WithName("vector-backfiller"))
+	}
+
+	scanner, err := writepath.ProvideScanner(cfg, backend, vectorBackend, embedderInstance)
+	if err != nil {
+		return nil, fmt.Errorf("create vector write-path scanner: %w", err)
+	}
+	if scanner != nil {
+		s.subservices = append(s.subservices,
+			services.NewBasicService(nil, scanner.Run, nil).WithName("vector-write-scanner"))
 	}
 
 	err = s.initializeSubservicesManager()

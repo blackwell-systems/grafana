@@ -42,8 +42,19 @@ type VectorBackend interface {
 	// resources that already have embeddings.
 	Exists(ctx context.Context, namespace, model, resource, uid string) (bool, error)
 
-	// GetLatestRV is the global write-pipeline checkpoint. 0 if empty.
+	// GetLatestRV is the write-path scanner checkpoint. 0 if never advanced.
 	GetLatestRV(ctx context.Context) (int64, error)
+
+	// SetLatestRV advances the write-path scanner checkpoint. The update is
+	// monotonic — a smaller rv is silently ignored, so concurrent callers
+	// can't rewind the cursor.
+	SetLatestRV(ctx context.Context, rv int64) error
+
+	// TryAcquireScannerLock obtains a session-level advisory lock so only
+	// one write-path scanner runs across replicas. Same release/leak
+	// semantics as TryAcquireBackfillLock; the locks use distinct names so
+	// they don't contend with each other.
+	TryAcquireScannerLock(ctx context.Context) (release func(), acquired bool, err error)
 
 	// ListIncompleteBackfillJobs returns one row per active backfill job.
 	// Operators add rows via SQL migrations; the resource embedder drains them.

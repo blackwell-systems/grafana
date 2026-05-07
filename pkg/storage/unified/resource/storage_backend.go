@@ -1540,9 +1540,12 @@ func applyPagination(keys []DataKey, lastSeenRV int64) []DataKey {
 // before sinceRv. If a `lastCalledWithSinceRv` parameter is passed, the
 // lookback may be skipped as an optimization.
 func (k *kvStorageBackend) ListModifiedSince(ctx context.Context, key NamespacedResource, sinceRv int64, lastCalledWithSinceRv *time.Time) (int64, iter.Seq2[*ModifiedResource, error]) {
-	if !key.Valid() {
+	// Empty namespace is allowed and signals a cross-namespace scan; the
+	// write-path scanner uses this to walk every dashboard change with one
+	// call.
+	if key.Group == "" || key.Resource == "" {
 		return 0, func(yield func(*ModifiedResource, error) bool) {
-			yield(nil, fmt.Errorf("group, resource, and namespace are required"))
+			yield(nil, fmt.Errorf("group and resource are required"))
 		}
 	}
 
@@ -1666,7 +1669,10 @@ func (k *kvStorageBackend) listModifiedSinceDataStore(ctx context.Context, key N
 				lastSeenDataKey = dataKey
 			}
 
-			if lastSeenResource.Key.Name != dataKey.Name {
+			// Boundary detection includes namespace because key.Namespace
+			// may be empty (cross-namespace scan); two resources with the
+			// same name in different namespaces must yield separately.
+			if lastSeenResource.Key.Namespace != dataKey.Namespace || lastSeenResource.Key.Name != dataKey.Name {
 				value, err := k.getValueFromDataStore(ctx, lastSeenDataKey)
 				if err != nil {
 					yield(&ModifiedResource{}, err)
@@ -1723,15 +1729,19 @@ func (k *kvStorageBackend) listModifiedSinceEventStore(ctx context.Context, key 
 				return
 			}
 
-			if evtKey.Group != key.Group || evtKey.Resource != key.Resource || evtKey.Namespace != key.Namespace {
+			if evtKey.Group != key.Group || evtKey.Resource != key.Resource {
+				continue
+			}
+			// Empty key.Namespace = cross-namespace scan; otherwise filter to one namespace.
+			if key.Namespace != "" && evtKey.Namespace != key.Namespace {
 				continue
 			}
 
-			if _, ok := seen[evtKey.Name]; ok {
+			dedupKey := evtKey.Namespace + "/" + evtKey.Name
+			if _, ok := seen[dedupKey]; ok {
 				continue
 			}
-
-			seen[evtKey.Name] = struct{}{}
+			seen[dedupKey] = struct{}{}
 			value, err := k.getValueFromDataStore(ctx, DataKey(evtKey))
 			if err != nil {
 				yield(&ModifiedResource{}, err)

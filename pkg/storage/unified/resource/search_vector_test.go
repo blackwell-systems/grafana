@@ -91,6 +91,10 @@ func (f *fakeVectorBackend) Exists(context.Context, string, string, string, stri
 	return false, nil
 }
 func (f *fakeVectorBackend) GetLatestRV(context.Context) (int64, error) { return 0, nil }
+func (f *fakeVectorBackend) SetLatestRV(context.Context, int64) error   { return nil }
+func (f *fakeVectorBackend) TryAcquireScannerLock(context.Context) (func(), bool, error) {
+	return func() {}, true, nil
+}
 func (f *fakeVectorBackend) ListIncompleteBackfillJobs(context.Context) ([]vector.BackfillJob, error) {
 	return nil, nil
 }
